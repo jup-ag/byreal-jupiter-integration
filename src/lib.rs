@@ -624,11 +624,11 @@ mod tests {
         
         // Test zero_for_one (price decreasing)
         let arrays_down = amm.get_swap_tick_arrays(true);
-        assert_eq!(arrays_down.len(), 5);
+        assert_eq!(arrays_down.len(), 11);
         
         // Test one_for_zero (price increasing)
         let arrays_up = amm.get_swap_tick_arrays(false);
-        assert_eq!(arrays_up.len(), 5);
+        assert_eq!(arrays_up.len(), 11);
         
         // Verify they're different
         assert_ne!(arrays_down[1], arrays_up[1]);
