@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use anchor_lang::prelude::*;
-use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey, program_pack::Pack};
+use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
+use solana_program::program_pack::Pack;
 use std::collections::{HashMap, HashSet};
 
 use jupiter_amm_interface::{
