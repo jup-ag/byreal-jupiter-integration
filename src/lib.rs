@@ -54,31 +54,21 @@ impl PoolStateExt {
         // First deserialize the base PoolState
         let base = PoolState::try_deserialize(&mut &data[..])
             .map_err(|e| anyhow!("Failed to deserialize PoolState: {}", e))?;
-        
-        // The decay fee fields are located after recent_epoch (at offset 1368)
-        // According to the contract:
-        // - recent_epoch is at offset 1360 (8 bytes)
-        // - decay_fee_flag is at offset 1368 (1 byte)
-        // - decay_fee_init_fee_rate is at offset 1369 (1 byte)
-        // - decay_fee_decrease_rate is at offset 1370 (1 byte)
-        // - decay_fee_decrease_interval is at offset 1371 (1 byte)
-        
-        // Calculate offsets based on PoolState structure
-        // PoolState size should be consistent with the contract
-        const DECAY_FEE_OFFSET: usize = 1368;
-        
-        let mut decay_fee_flag = 0u8;
-        let mut decay_fee_init_fee_rate = 0u8;
-        let mut decay_fee_decrease_rate = 0u8;
-        let mut decay_fee_decrease_interval = 0u8;
-        
-        if data.len() > DECAY_FEE_OFFSET + 3 {
-            decay_fee_flag = data[DECAY_FEE_OFFSET];
-            decay_fee_init_fee_rate = data[DECAY_FEE_OFFSET + 1];
-            decay_fee_decrease_rate = data[DECAY_FEE_OFFSET + 2];
-            decay_fee_decrease_interval = data[DECAY_FEE_OFFSET + 3];
-        }
-        
+
+        // Parse extended fields from base.padding1[0]
+        // padding1[0] packs the following bytes in little-endian order:
+        // [0]: decay_fee_flag (bit flags)
+        // [1]: decay_fee_init_fee_rate (percentage 0-100)
+        // [2]: decay_fee_decrease_rate (percentage 0-100, per interval)
+        // [3]: decay_fee_decrease_interval (seconds per interval)
+        // Extract packed value from padding1[0]
+        // Keep consistent with solana-dex-router/src/types/clmm.rs
+        let packed = base.padding1[0] as u64;
+        let decay_fee_flag = (packed & 0xFF) as u8;
+        let decay_fee_init_fee_rate = ((packed >> 8) & 0xFF) as u8;
+        let decay_fee_decrease_rate = ((packed >> 16) & 0xFF) as u8;
+        let decay_fee_decrease_interval = ((packed >> 24) & 0xFF) as u8;
+
         Ok(Self {
             base,
             decay_fee_flag,
@@ -311,20 +301,18 @@ impl ByrealClmmAmm {
         }
 
         Ok(SwapResult {
-            amount_in: if is_base_input { 
-                amount_specified - state.amount_specified_remaining 
-            } else { 
-                state.amount_calculated 
+            amount_in: if is_base_input {
+                amount_specified - state.amount_specified_remaining
+            } else {
+                state.amount_calculated
             },
-            amount_out: if is_base_input { 
-                state.amount_calculated 
-            } else { 
-                amount_specified - state.amount_specified_remaining 
+            amount_out: if is_base_input {
+                state.amount_calculated
+            } else {
+                amount_specified - state.amount_specified_remaining
             },
             fee_amount: state.fee_amount,
             fee_rate,
-            sqrt_price_x64: state.sqrt_price_x64,
-            tick: state.tick,
         })
     }
 
@@ -588,10 +576,6 @@ struct SwapResult {
     amount_out: u64,
     fee_amount: u64,
     fee_rate: u32,
-    #[allow(dead_code)]
-    sqrt_price_x64: u128,
-    #[allow(dead_code)]
-    tick: i32,
 }
 
 #[cfg(test)]
