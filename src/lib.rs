@@ -433,15 +433,39 @@ impl ByrealClmmAmm {
             state.fee_amount += step.fee_amount;
 
             if is_base_input {
-                state.amount_specified_remaining = state.amount_specified_remaining
-                    .saturating_sub(step.amount_in + step.fee_amount);
-                state.amount_calculated = state.amount_calculated
-                    .saturating_add(step.amount_out);
+                state.amount_specified_remaining = state
+                    .amount_specified_remaining
+                    .checked_sub(step.amount_in + step.fee_amount)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compute_swap: step.amount_in + fee_amount exceeds remaining (exact in)"
+                        )
+                    })?;
+                state.amount_calculated = state
+                    .amount_calculated
+                    .checked_add(step.amount_out)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compute_swap: amount_calculated overflow when adding amount_out (exact in)"
+                        )
+                    })?;
             } else {
-                state.amount_specified_remaining = state.amount_specified_remaining
-                    .saturating_sub(step.amount_out);
-                state.amount_calculated = state.amount_calculated
-                    .saturating_add(step.amount_in + step.fee_amount);
+                state.amount_specified_remaining = state
+                    .amount_specified_remaining
+                    .checked_sub(step.amount_out)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compute_swap: step.amount_out exceeds remaining (exact out)"
+                        )
+                    })?;
+                state.amount_calculated = state
+                    .amount_calculated
+                    .checked_add(step.amount_in + step.fee_amount)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compute_swap: amount_calculated overflow when adding amount_in + fee (exact out)"
+                        )
+                    })?;
             }
 
             // Update tick/liquidity if we've crossed an initialized tick boundary
