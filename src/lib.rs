@@ -102,11 +102,6 @@ impl ByrealClmmAmm {
     fn find_next_initialized_tick(&self, current_tick: i32, zero_for_one: bool) -> Result<i32> {
         let spacing = self.pool_state.tick_spacing as u16;
         let arrays = self.get_swap_tick_arrays(zero_for_one);
-        if arrays.is_empty() {
-            // fallback to arithmetic next grid if nothing available
-            let step = i32::from(spacing);
-            return Ok(if zero_for_one { ((current_tick / step) - 1) * step } else { ((current_tick / step) + 1) * step });
-        }
 
         // Determine the array corresponding to current_tick
         let current_start = TickUtils::get_array_start_index(current_tick, spacing);
@@ -206,9 +201,13 @@ impl ByrealClmmAmm {
             }
         }
 
-        // Fallback grid if nothing found
-        let step = i32::from(spacing);
-        Ok(if zero_for_one { ((current_tick / step) - 1) * step } else { ((current_tick / step) + 1) * step })
+        // If we reach here, we failed to locate any initialized tick in the
+        // discovered tick arrays. Treat this as a hard error instead of
+        // falling back to an arithmetic grid, to avoid returning quotes
+        // that ignore missing tick array data.
+        Err(anyhow!(
+            "Failed to find next initialized tick: missing or incomplete tick array data"
+        ))
     }
 
     /// Get liquidity_net for a given tick index from the cached tick arrays.
@@ -470,18 +469,34 @@ impl ByrealClmmAmm {
 
             // Update tick/liquidity if we've crossed an initialized tick boundary
             if state.sqrt_price_x64 == sqrt_price_next {
-                // Adjust liquidity on crossing initialized tick
-                if let Some(mut liq_net) = self.get_tick_liquidity_net(next_tick) {
-                    if zero_for_one { liq_net = -liq_net; }
-                    state.liquidity = liquidity_math::add_delta(state.liquidity, liq_net)
-                        .map_err(|e| anyhow!("Failed to adjust liquidity at tick {}: {:?}", next_tick, e))?;
-                }
+                // Adjust liquidity on crossing initialized tick. If the
+                // required tick array data is missing, treat this as a
+                // hard error instead of silently assuming zero liquidity.
+                let mut liq_net = self
+                    .get_tick_liquidity_net(next_tick)
+                    .ok_or_else(|| anyhow!("Missing tick array data for tick {}", next_tick))?;
+                if zero_for_one { liq_net = -liq_net; }
+                state.liquidity = liquidity_math::add_delta(state.liquidity, liq_net)
+                    .map_err(|e| anyhow!("Failed to adjust liquidity at tick {}: {:?}", next_tick, e))?;
                 state.tick = if zero_for_one { next_tick - 1 } else { next_tick };
                 tick_crossings += 1;
             } else {
                 state.tick = tick_math::get_tick_at_sqrt_price(state.sqrt_price_x64)
                     .map_err(|e| anyhow!("Failed to get tick at sqrt price: {:?}", e))?;
             }
+        }
+
+        // If we exit the loop because we've hit the maximum number of tick
+        // array crossings but still have remaining amount to swap, this
+        // indicates that not enough tick arrays were provided to complete
+        // the simulation. Surface this as an error instead of returning
+        // a partial quote.
+        if tick_crossings >= MAX_TICK_ARRAY_CROSSINGS && state.amount_specified_remaining > 0 {
+            return Err(anyhow!(
+                "Not enough tick arrays to simulate swap: crossed {} arrays, remaining amount {}",
+                tick_crossings,
+                state.amount_specified_remaining
+            ));
         }
 
         Ok(SwapResult {
@@ -1149,5 +1164,71 @@ mod tests {
         // zero_for_one=true (price decreasing): next initialized <= current should be 50 in current array
         let next_down = amm.find_next_initialized_tick(amm.pool_state.tick_current, true).unwrap();
         assert_eq!(next_down, 50);
+    }
+
+    #[test]
+    fn test_find_next_initialized_tick_errors_when_missing_tick_arrays() {
+        let pool_key = Pubkey::new_unique();
+        let program_id = BYREAL_CLMM_PROGRAM;
+
+        // Minimal pool state: non-zero spacing and some current tick
+        let mut pool_state = PoolState::default();
+        pool_state.tick_spacing = 10;
+        pool_state.tick_current = 0;
+
+        // AMM without any tick array account data loaded
+        let amm = ByrealClmmAmm {
+            key: pool_key,
+            label: "Test".to_string(),
+            program_id,
+            pool_state,
+            amm_config: AmmConfig::default(),
+            tick_arrays: HashMap::new(),
+            bitmap_extension: None,
+            observation_state: None,
+            vault_a_amount: 0,
+            vault_b_amount: 0,
+            clock_ref: ClockRef::default(),
+            tick_arrays_raw: HashMap::new(),
+        };
+
+        // With no tick array bytes available, next initialized tick lookup should fail
+        let res = amm.find_next_initialized_tick(amm.pool_state.tick_current, true);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_compute_swap_errors_when_not_enough_tick_arrays() {
+        let pool_key = Pubkey::new_unique();
+        let program_id = BYREAL_CLMM_PROGRAM;
+
+        // Minimal pool state with some liquidity so that compute_swap would
+        // attempt to walk ticks, but we deliberately do not provide any
+        // tick array account data.
+        let mut pool_state = PoolState::default();
+        pool_state.tick_spacing = 10;
+        pool_state.tick_current = 0;
+        pool_state.sqrt_price_x64 = tick_math::get_sqrt_price_at_tick(0).unwrap();
+        pool_state.liquidity = 1_000_000u128;
+
+        let amm = ByrealClmmAmm {
+            key: pool_key,
+            label: "Test".to_string(),
+            program_id,
+            pool_state,
+            amm_config: AmmConfig::default(),
+            tick_arrays: HashMap::new(),
+            bitmap_extension: None,
+            observation_state: None,
+            vault_a_amount: 0,
+            vault_b_amount: 0,
+            clock_ref: ClockRef::default(),
+            tick_arrays_raw: HashMap::new(),
+        };
+
+        // Attempting to compute a swap without tick array data should now
+        // surface an error instead of silently falling back.
+        let res = amm.compute_swap(true, 1_000u64, true, None);
+        assert!(res.is_err());
     }
 }
