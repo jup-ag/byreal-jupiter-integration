@@ -1562,7 +1562,7 @@ mod tests {
 
         // Path is relative to this crate's src/, use two levels up.
         let program_bytes =
-            include_bytes!("/Users/sh01426ml/Projects/rust/byreal-clmm/target/sbf-solana-solana/release/byreal_clmm.so");
+            include_bytes!("./byreal_clmm.so");
         let clmm_program = RawPubkey::new_from_array(BYREAL_CLMM_PROGRAM.to_bytes());
         svm.add_program(clmm_program, program_bytes).unwrap();
 
@@ -2071,7 +2071,7 @@ mod tests {
             .with_blockhash_check(false);
 
         let program_bytes =
-            include_bytes!("/Users/sh01426ml/Projects/rust/byreal-clmm/target/sbf-solana-solana/release/byreal_clmm.so");
+            include_bytes!("./byreal_clmm.so");
         let clmm_program = RawPubkey::new_from_array(BYREAL_CLMM_PROGRAM.to_bytes());
         svm.add_program(clmm_program, program_bytes).unwrap();
 
