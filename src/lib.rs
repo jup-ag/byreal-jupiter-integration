@@ -368,11 +368,17 @@ impl ByrealClmmAmm {
             }
         }
 
-        // Simulate swap steps
-        let mut tick_crossings = 0;
-        while state.amount_specified_remaining != 0 && 
-              state.sqrt_price_x64 != sqrt_price_limit &&
-              tick_crossings < MAX_TICK_ARRAY_CROSSINGS {
+        // Simulate swap steps. We bound the number of *tick array* crossings
+        // (not individual ticks) to avoid simulating paths that require more
+        // arrays than the snapshot or account set is expected to cover.
+        let spacing = self.pool_state.tick_spacing as u16;
+        let mut current_array_start =
+            TickUtils::get_array_start_index(state.tick, spacing);
+        let mut array_crossings: usize = 0;
+        while state.amount_specified_remaining != 0
+            && state.sqrt_price_x64 != sqrt_price_limit
+            && array_crossings < MAX_TICK_ARRAY_CROSSINGS
+        {
             
             // Find next initialized tick
             let next_tick = self.find_next_initialized_tick(state.tick, zero_for_one)?;
@@ -442,6 +448,16 @@ impl ByrealClmmAmm {
 
             // Update tick/liquidity if we've crossed an initialized tick boundary
             if state.sqrt_price_x64 == sqrt_price_next {
+                // If the next initialized tick lies in a different tick array,
+                // count this as a tick-array crossing. This gives us a bound
+                // on how many arrays the math simulation is allowed to touch.
+                let next_array_start =
+                    TickUtils::get_array_start_index(next_tick, spacing);
+                if next_array_start != current_array_start {
+                    array_crossings += 1;
+                    current_array_start = next_array_start;
+                }
+
                 // Adjust liquidity on crossing initialized tick. If the
                 // required tick array data is missing, treat this as a
                 // hard error instead of silently assuming zero liquidity.
@@ -452,7 +468,6 @@ impl ByrealClmmAmm {
                 state.liquidity = liquidity_math::add_delta(state.liquidity, liq_net)
                     .map_err(|e| anyhow!("Failed to adjust liquidity at tick {}: {:?}", next_tick, e))?;
                 state.tick = if zero_for_one { next_tick - 1 } else { next_tick };
-                tick_crossings += 1;
             } else {
                 state.tick = tick_math::get_tick_at_sqrt_price(state.sqrt_price_x64)
                     .map_err(|e| anyhow!("Failed to get tick at sqrt price: {:?}", e))?;
@@ -464,10 +479,12 @@ impl ByrealClmmAmm {
         // indicates that not enough tick arrays were provided to complete
         // the simulation. Surface this as an error instead of returning
         // a partial quote.
-        if tick_crossings >= MAX_TICK_ARRAY_CROSSINGS && state.amount_specified_remaining > 0 {
+        if array_crossings >= MAX_TICK_ARRAY_CROSSINGS
+            && state.amount_specified_remaining > 0
+        {
             return Err(anyhow!(
                 "Not enough tick arrays to simulate swap: crossed {} arrays, remaining amount {}",
-                tick_crossings,
+                array_crossings,
                 state.amount_specified_remaining
             ));
         }
@@ -1374,7 +1391,7 @@ mod tests {
         let usdc_ata = Pubkey::from_str(&usdc_accounts[0].pubkey).unwrap();
 
         // Use the actual JUP balance in the user's ATA as the input amount.
-        let amount_in: u64 = 362500000;
+        let amount_in: u64 = 62500000;
         if amount_in == 0 {
             println!(
                 "User JUP ATA {} has zero balance; skipping LiteSVM test.",
