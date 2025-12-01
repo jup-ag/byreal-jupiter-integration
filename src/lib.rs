@@ -28,6 +28,8 @@ pub const BYREAL_CLMM_PROGRAM: Pubkey =
 
 // Constants
 pub const TICK_ARRAY_SIZE: i32 = 60;
+const MAX_TICK_ARRAY_CROSSINGS: usize = 10;
+const DEFAULT_MAX_ONE_SIDE_TICK_ARRAYS: usize = 10;
 
 #[derive(Clone)]
 pub enum DynamicTickArrayState {
@@ -393,6 +395,9 @@ impl ByrealClmmAmm {
         use std::collections::BTreeSet;
 
         let mut start_indexes: BTreeSet<i32> = BTreeSet::new();
+        let limit = self
+            .max_one_side_tick_arrays
+            .max(DEFAULT_MAX_ONE_SIDE_TICK_ARRAYS);
 
         let mut collect_dir = |zero_for_one: bool, limit: usize| {
             if limit == 0 {
@@ -420,8 +425,8 @@ impl ByrealClmmAmm {
         };
 
         // Try bitmap-guided discovery (limit each direction)
-        collect_dir(true, self.max_one_side_tick_arrays);
-        collect_dir(false, self.max_one_side_tick_arrays);
+        collect_dir(true, limit);
+        collect_dir(false, limit);
 
         // Fallback to naive neighbors if nothing collected
         if start_indexes.is_empty() {
@@ -429,9 +434,10 @@ impl ByrealClmmAmm {
             let current_tick = self.pool_state.tick_current;
             let current_start_index = TickUtils::get_array_start_index(current_tick, tick_spacing);
             start_indexes.insert(current_start_index);
-            for i in 1..self.max_one_side_tick_arrays {
+            for i in 1..limit {
                 let offset = (TICK_ARRAY_SIZE * i as i32) * i32::from(tick_spacing);
                 start_indexes.insert(current_start_index.saturating_sub(offset));
+                start_indexes.insert(current_start_index.saturating_add(offset));
             }
         }
 
@@ -551,9 +557,15 @@ impl ByrealClmmAmm {
         // Initialize tick-array navigation state so that tick discovery mirrors
         // the on-chain `swap_internal` helper logic.
         let mut nav = self.init_tick_nav_state(zero_for_one)?;
+        let spacing = self.pool_state.tick_spacing as u16;
+        let mut current_array_start = TickUtils::get_array_start_index(state.tick, spacing);
+        let mut array_crossings: usize = 0;
 
         // Simulate swap steps
-        while state.amount_specified_remaining != 0 && state.sqrt_price_x64 != sqrt_price_limit {
+        while state.amount_specified_remaining != 0
+            && state.sqrt_price_x64 != sqrt_price_limit
+            && array_crossings < MAX_TICK_ARRAY_CROSSINGS
+        {
             // Find next initialized tick
             let next_tick =
                 self.find_next_initialized_tick_with_nav(state.tick, zero_for_one, &mut nav)?;
@@ -622,6 +634,12 @@ impl ByrealClmmAmm {
 
             // Update tick/liquidity if we've crossed an initialized tick boundary
             if state.sqrt_price_x64 == sqrt_price_next {
+                let next_array_start = TickUtils::get_array_start_index(next_tick, spacing);
+                if next_array_start != current_array_start {
+                    array_crossings += 1;
+                    current_array_start = next_array_start;
+                }
+
                 // Adjust liquidity on crossing initialized tick. If the
                 // required tick array data is missing, treat this as a
                 // hard error instead of silently assuming zero liquidity.
@@ -646,6 +664,14 @@ impl ByrealClmmAmm {
                 state.tick = tick_math::get_tick_at_sqrt_price(state.sqrt_price_x64)
                     .map_err(|e| anyhow!("Failed to get tick at sqrt price: {:?}", e))?;
             }
+        }
+
+        if array_crossings >= MAX_TICK_ARRAY_CROSSINGS && state.amount_specified_remaining > 0 {
+            return Err(anyhow!(
+                "Not enough tick arrays to simulate swap: crossed {} arrays, remaining amount {}",
+                array_crossings,
+                state.amount_specified_remaining
+            ));
         }
 
         Ok(SwapResult {
@@ -718,9 +744,14 @@ impl ByrealClmmAmm {
             ));
         }
         let tick_arrays = &self.tick_array_cache;
+        let mut current_array_start = TickUtils::get_array_start_index(state.tick, spacing);
+        let mut array_crossings: usize = 0;
 
         // Simulate swap steps
-        while state.amount_specified_remaining != 0 && state.sqrt_price_x64 != sqrt_price_limit {
+        while state.amount_specified_remaining != 0
+            && state.sqrt_price_x64 != sqrt_price_limit
+            && array_crossings < MAX_TICK_ARRAY_CROSSINGS
+        {
             // Find next initialized tick using cached arrays
             let next_tick = self.find_next_initialized_tick_cached(
                 state.tick,
@@ -794,6 +825,12 @@ impl ByrealClmmAmm {
 
             // Update tick/liquidity if we've crossed an initialized tick boundary
             if state.sqrt_price_x64 == sqrt_price_next {
+                let next_array_start = TickUtils::get_array_start_index(next_tick, spacing);
+                if next_array_start != current_array_start {
+                    array_crossings += 1;
+                    current_array_start = next_array_start;
+                }
+
                 let mut liq_net = self
                     .get_tick_liquidity_net_cached(&tick_arrays, next_tick, spacing)
                     .ok_or_else(|| anyhow!("Missing tick array data for tick {}", next_tick))?;
@@ -815,6 +852,14 @@ impl ByrealClmmAmm {
                 state.tick = tick_math::get_tick_at_sqrt_price(state.sqrt_price_x64)
                     .map_err(|e| anyhow!("Failed to get tick at sqrt price: {:?}", e))?;
             }
+        }
+
+        if array_crossings >= MAX_TICK_ARRAY_CROSSINGS && state.amount_specified_remaining > 0 {
+            return Err(anyhow!(
+                "Not enough tick arrays to simulate swap: crossed {} arrays, remaining amount {}",
+                array_crossings,
+                state.amount_specified_remaining
+            ));
         }
 
         Ok(SwapResult {
@@ -839,6 +884,9 @@ impl ByrealClmmAmm {
     /// according to the direction, then following in that direction. Falls back to adjacent offsets.
     pub fn get_swap_tick_arrays(&self, zero_for_one: bool) -> Vec<Pubkey> {
         let mut addrs: Vec<Pubkey> = Vec::new();
+        let limit = self
+            .max_one_side_tick_arrays
+            .max(DEFAULT_MAX_ONE_SIDE_TICK_ARRAYS);
 
         // Preferred: bitmap-guided discovery from the first initialized tick array
         if let Ok((_, first_start)) = self
@@ -847,7 +895,7 @@ impl ByrealClmmAmm {
         {
             addrs.push(self.get_tick_array_address(first_start));
             let mut cur = first_start;
-            for _ in 1..self.max_one_side_tick_arrays {
+            for _ in 1..limit {
                 match self.pool_state.next_initialized_tick_array_start_index(
                     &self.bitmap_extension,
                     cur,
@@ -868,7 +916,7 @@ impl ByrealClmmAmm {
         let current_tick = self.pool_state.tick_current;
         let current_start_index = TickUtils::get_array_start_index(current_tick, tick_spacing);
         addrs.push(self.get_tick_array_address(current_start_index));
-        for i in 1..self.max_one_side_tick_arrays {
+        for i in 1..limit {
             let offset = (TICK_ARRAY_SIZE * i as i32) * i32::from(tick_spacing);
             let s = if zero_for_one {
                 current_start_index.saturating_sub(offset)
