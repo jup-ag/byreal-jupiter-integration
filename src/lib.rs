@@ -36,6 +36,39 @@ pub enum DynamicTickArrayState {
 }
 
 impl DynamicTickArrayState {
+    /// Find next initialized tick in a fixed (Anchor) tick array without cloning.
+    /// This mirrors the direction-sensitive search used by the on-chain helpers,
+    /// but operates read-only to avoid a per-call array clone.
+    fn find_initialized_tick_fixed(
+        ta: &TickArrayState,
+        cur_tick: i32,
+        zero_for_one: bool,
+        allow_first: bool,
+    ) -> Option<i32> {
+        if zero_for_one {
+            // Walk from high to low ticks.
+            for t in ta.ticks.iter().rev() {
+                if !t.is_initialized() {
+                    continue;
+                }
+                if allow_first || t.tick <= cur_tick {
+                    return Some(t.tick);
+                }
+            }
+        } else {
+            // Walk from low to high ticks.
+            for t in ta.ticks.iter() {
+                if !t.is_initialized() {
+                    continue;
+                }
+                if allow_first || t.tick > cur_tick {
+                    return Some(t.tick);
+                }
+            }
+        }
+        None
+    }
+
     /// Decode a dynamic tick array from raw bytes into header + tick slice views.
     fn decode_dyn_tick_array(data: &[u8]) -> Option<(DynTickArrayState, Vec<TickState>)> {
         if data.len() < 8 {
@@ -49,7 +82,7 @@ impl DynamicTickArrayState {
         }
 
         let header_bytes = &data[8..(DynTickArrayState::HEADER_LEN)];
-        let header: &DynTickArrayState = bytemuck::from_bytes(header_bytes);
+        let header: &DynTickArrayState = bytemuck::try_from_bytes(header_bytes).ok()?;
         let ticks_bytes = &data[DynTickArrayState::HEADER_LEN..];
         // Safety: TickState derives AnyBitPattern in the CLMM crate
         let ticks: &[TickState] = bytemuck::try_cast_slice(ticks_bytes).ok()?;
@@ -103,27 +136,18 @@ impl DynamicTickArrayState {
                         header.next_initialized_tick_index(ticks, cur_tick, spacing, zero_for_one)
                     {
                         let idx = local_idx as usize;
-                        return Some(ticks[idx].tick);
+                        return ticks.get(idx).map(|t| t.tick);
                     }
                 } else if let Ok(local_idx) =
                     header.first_initialized_tick_index(ticks, zero_for_one)
                 {
                     let idx = local_idx as usize;
-                    return Some(ticks[idx].tick);
+                    return ticks.get(idx).map(|t| t.tick);
                 }
                 None
             }
             DynamicTickArrayState::Fixed(ta) => {
-                let mut ta = ta.clone();
-                if let Ok(Some(ts)) = ta.next_initialized_tick(cur_tick, spacing, zero_for_one) {
-                    return Some(ts.tick);
-                }
-                if allow_first {
-                    if let Ok(ts) = ta.first_initialized_tick(zero_for_one) {
-                        return Some(ts.tick);
-                    }
-                }
-                None
+                Self::find_initialized_tick_fixed(ta, cur_tick, zero_for_one, allow_first)
             }
         }
     }
@@ -133,13 +157,13 @@ impl DynamicTickArrayState {
         match self {
             DynamicTickArrayState::Dynamic((header, ticks)) => {
                 if let Ok(i) = header.get_tick_index_in_array(tick_index, spacing) {
-                    return Some(ticks[i as usize].liquidity_net);
+                    return ticks.get(i as usize).map(|t| t.liquidity_net);
                 }
                 None
             }
             DynamicTickArrayState::Fixed(ta) => {
                 if let Ok(offset) = ta.get_tick_offset_in_array(tick_index, spacing) {
-                    return Some(ta.ticks[offset].liquidity_net);
+                    return ta.ticks.get(offset).map(|t| t.liquidity_net);
                 }
                 None
             }
@@ -159,9 +183,100 @@ pub struct ByrealClmmAmm {
     pub bitmap_extension: Option<TickArrayBitmapExtension>,
     pub max_one_side_tick_arrays: usize,
     pub dynamic_tick_arrays: HashMap<Pubkey, DynamicTickArrayState>,
+    /// Precomputed map from tick array start_index -> tick array state.
+    pub tick_array_cache: HashMap<i32, DynamicTickArrayState>,
 }
 
 impl ByrealClmmAmm {
+    /// Build a lightweight cache keyed by tick array start index so we avoid
+    /// recomputing PDAs or map lookups during the swap hot path.
+    pub fn save_tick_array_cache(&mut self) -> Result<()> {
+        self.tick_array_cache.clear();
+        for ta in self.dynamic_tick_arrays.values() {
+            self.tick_array_cache
+                .insert(ta.start_tick_index(), ta.clone());
+        }
+        Ok(())
+    }
+
+    /// Like `find_next_initialized_tick_with_nav`, but works off a pre-built
+    /// start-index cache to avoid PDA derivations and hashmap churn.
+    fn find_next_initialized_tick_cached<'a>(
+        &self,
+        current_tick: i32,
+        zero_for_one: bool,
+        nav: &mut TickNavState,
+        spacing: u16,
+        tick_arrays: &'a HashMap<i32, DynamicTickArrayState>,
+    ) -> Result<i32> {
+        loop {
+            let start_index = nav.current_valid_tick_array_start_index;
+            let tick_array = tick_arrays.get(&start_index).ok_or_else(|| {
+                anyhow!("Missing tick array data for start_index {}", start_index)
+            })?;
+
+            // 1. Try next_initialized_tick within the current array.
+            if let Some(t) =
+                tick_array.find_initialized_tick(current_tick, spacing, zero_for_one, false)
+            {
+                return Ok(t);
+            }
+
+            // 2. If nothing found and we haven't yet matched pool_current_tick_array,
+            // fall back to first_initialized_tick on this array (mirrors on-chain).
+            if !nav.is_match_pool_current_tick_array {
+                nav.is_match_pool_current_tick_array = true;
+                if let Some(t) =
+                    tick_array.find_initialized_tick(current_tick, spacing, zero_for_one, true)
+                {
+                    return Ok(t);
+                }
+            }
+
+            // 3. Advance to the next initialized tick array and take its first tick.
+            let next_arr = self.pool_state.next_initialized_tick_array_start_index(
+                &self.bitmap_extension,
+                nav.current_valid_tick_array_start_index,
+                zero_for_one,
+            )?;
+            let next_start = match next_arr {
+                Some(s) => s,
+                None => {
+                    return Err(anyhow!(
+                        "Liquidity insufficient: no further initialized tick arrays"
+                    ))
+                }
+            };
+            nav.current_valid_tick_array_start_index = next_start;
+
+            let next_tick_array = tick_arrays.get(&next_start).ok_or_else(|| {
+                anyhow!(
+                    "Missing tick array data for advanced start_index {}",
+                    next_start
+                )
+            })?;
+
+            if let Some(t) =
+                next_tick_array.find_initialized_tick(current_tick, spacing, zero_for_one, true)
+            {
+                return Ok(t);
+            }
+        }
+    }
+
+    /// Cached getter for liquidity_net using a start-index keyed cache.
+    fn get_tick_liquidity_net_cached(
+        &self,
+        tick_arrays: &HashMap<i32, DynamicTickArrayState>,
+        tick_index: i32,
+        spacing: u16,
+    ) -> Option<i128> {
+        let start = TickUtils::get_array_start_index(tick_index, spacing);
+        tick_arrays
+            .get(&start)?
+            .get_tick_liquidity_net(tick_index, spacing)
+    }
+
     /// Find next initialized tick using a navigation state that mirrors the
     /// on-chain `swap_internal` logic: walk within the current tick array
     /// using `next_initialized_tick`, optionally fall back to
@@ -521,7 +636,178 @@ impl ByrealClmmAmm {
                         anyhow!("Failed to adjust liquidity at tick {}: {:?}", next_tick, e)
                     })?;
                 state.tick = if zero_for_one {
-                    next_tick - 1
+                    next_tick
+                        .checked_sub(1)
+                        .ok_or_else(|| anyhow!("tick underflow when stepping left"))?
+                } else {
+                    next_tick
+                };
+            } else {
+                state.tick = tick_math::get_tick_at_sqrt_price(state.sqrt_price_x64)
+                    .map_err(|e| anyhow!("Failed to get tick at sqrt price: {:?}", e))?;
+            }
+        }
+
+        Ok(SwapResult {
+            amount_in: if is_base_input {
+                amount_specified - state.amount_specified_remaining
+            } else {
+                state.amount_calculated
+            },
+            amount_out: if is_base_input {
+                state.amount_calculated
+            } else {
+                amount_specified - state.amount_specified_remaining
+            },
+            fee_amount: state.fee_amount,
+            fee_rate,
+        })
+    }
+
+    /// Faster version of `compute_swap` that avoids repeated PDA derivations by
+    /// working off a start-index keyed cache built once per quote.
+    pub fn compute_swap_cached(
+        &self,
+        zero_for_one: bool,
+        amount_specified: u64,
+        is_base_input: bool,
+        sqrt_price_limit_x64: Option<u128>,
+        current_timestamp: i64,
+    ) -> Result<SwapResult> {
+        let sqrt_price_limit = sqrt_price_limit_x64.unwrap_or_else(|| {
+            if zero_for_one {
+                MIN_SQRT_PRICE_X64 + 1
+            } else {
+                MAX_SQRT_PRICE_X64 - 1
+            }
+        });
+
+        let mut state = SwapState {
+            amount_specified_remaining: amount_specified,
+            amount_calculated: 0,
+            sqrt_price_x64: self.pool_state.sqrt_price_x64,
+            tick: self.pool_state.tick_current,
+            liquidity: self.pool_state.liquidity,
+            fee_amount: 0,
+        };
+
+        // Calculate fee rate considering decay fee
+        let mut fee_rate = self.amm_config.trade_fee_rate;
+
+        if self.is_decay_fee_enabled() {
+            if let Some(decay_fee_rate) = if zero_for_one && self.is_decay_fee_on_sell_mint0() {
+                self.get_decay_fee_rate(current_timestamp as u64)
+            } else if !zero_for_one && self.is_decay_fee_on_sell_mint1() {
+                self.get_decay_fee_rate(current_timestamp as u64)
+            } else {
+                None
+            } {
+                // Use decay fee if it's higher than the base fee
+                if decay_fee_rate > fee_rate {
+                    fee_rate = decay_fee_rate;
+                }
+            }
+        }
+
+        // Initialize tick-array navigation state and cache
+        let mut nav = self.init_tick_nav_state(zero_for_one)?;
+        let spacing = self.pool_state.tick_spacing as u16;
+        if self.tick_array_cache.is_empty() {
+            return Err(anyhow!(
+                "tick_array_cache is empty; call save_tick_array_cache after loading tick arrays"
+            ));
+        }
+        let tick_arrays = &self.tick_array_cache;
+
+        // Simulate swap steps
+        while state.amount_specified_remaining != 0 && state.sqrt_price_x64 != sqrt_price_limit {
+            // Find next initialized tick using cached arrays
+            let next_tick = self.find_next_initialized_tick_cached(
+                state.tick,
+                zero_for_one,
+                &mut nav,
+                spacing,
+                &tick_arrays,
+            )?;
+
+            let sqrt_price_next = tick_math::get_sqrt_price_at_tick(next_tick)
+                .map_err(|e| anyhow!("Failed to get sqrt price at tick {}: {}", next_tick, e))?;
+
+            let target_price = if (zero_for_one && sqrt_price_next < sqrt_price_limit)
+                || (!zero_for_one && sqrt_price_next > sqrt_price_limit)
+            {
+                sqrt_price_limit
+            } else {
+                sqrt_price_next
+            };
+
+            // Compute swap step
+            let step = swap_math::compute_swap_step(
+                state.sqrt_price_x64,
+                target_price,
+                state.liquidity,
+                state.amount_specified_remaining,
+                fee_rate,
+                is_base_input,
+                zero_for_one,
+                current_timestamp as u32,
+            )
+            .map_err(|e| anyhow!("Swap step computation failed: {:?}", e))?;
+
+            // Update state
+            state.sqrt_price_x64 = step.sqrt_price_next_x64;
+            state.fee_amount += step.fee_amount;
+
+            if is_base_input {
+                state.amount_specified_remaining = state
+                    .amount_specified_remaining
+                    .checked_sub(step.amount_in + step.fee_amount)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compute_swap: step.amount_in + fee_amount exceeds remaining (exact in)"
+                        )
+                    })?;
+                state.amount_calculated = state
+                    .amount_calculated
+                    .checked_add(step.amount_out)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compute_swap: amount_calculated overflow when adding amount_out (exact in)"
+                        )
+                    })?;
+            } else {
+                state.amount_specified_remaining = state
+                    .amount_specified_remaining
+                    .checked_sub(step.amount_out)
+                    .ok_or_else(|| {
+                        anyhow!("compute_swap: step.amount_out exceeds remaining (exact out)")
+                    })?;
+                state.amount_calculated = state
+                    .amount_calculated
+                    .checked_add(step.amount_in + step.fee_amount)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compute_swap: amount_calculated overflow when adding amount_in + fee (exact out)"
+                        )
+                    })?;
+            }
+
+            // Update tick/liquidity if we've crossed an initialized tick boundary
+            if state.sqrt_price_x64 == sqrt_price_next {
+                let mut liq_net = self
+                    .get_tick_liquidity_net_cached(&tick_arrays, next_tick, spacing)
+                    .ok_or_else(|| anyhow!("Missing tick array data for tick {}", next_tick))?;
+                if zero_for_one {
+                    liq_net = -liq_net;
+                }
+                state.liquidity =
+                    liquidity_math::add_delta(state.liquidity, liq_net).map_err(|e| {
+                        anyhow!("Failed to adjust liquidity at tick {}: {:?}", next_tick, e)
+                    })?;
+                state.tick = if zero_for_one {
+                    next_tick
+                        .checked_sub(1)
+                        .ok_or_else(|| anyhow!("tick underflow when stepping left"))?
                 } else {
                     next_tick
                 };
