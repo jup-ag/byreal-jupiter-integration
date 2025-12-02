@@ -11,7 +11,7 @@ solana-sdk = "2.3.0"
 solana-program = "2.3.0"
 
 # Raydium dependencies
-byreal-clmm = { git = "https://github.com/byreal-git/byreal-clmm.git", rev = "2badd50e51904bf292bc55055406b0acaea4a43f" }
+byreal-clmm = { git = "https://github.com/byreal-git/byreal-clmm.git", rev = "2badd50e51904bf292bc55055406b0acaea4a43f", features = ["no-entrypoint"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 [features]
