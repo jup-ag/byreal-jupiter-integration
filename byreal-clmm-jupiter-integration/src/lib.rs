@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anyhow::{anyhow, ensure, Result};
-use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
+use solana_instruction::AccountMeta;
+use solana_pubkey::Pubkey;
 use std::{
     collections::{HashMap, HashSet},
     sync::{atomic::AtomicI64, Arc},
@@ -18,15 +19,15 @@ use byreal_clmm_common::{
 // Program IDs
 #[cfg(feature = "mainnet")]
 pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_sdk::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
+    solana_pubkey::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 #[cfg(feature = "devnet")]
 pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_sdk::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
+    solana_pubkey::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
 
 #[cfg(not(any(feature = "mainnet", feature = "devnet")))]
 pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_sdk::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
+    solana_pubkey::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 pub const ID: Pubkey = BYREAL_CLMM_PROGRAM;
 
@@ -150,6 +151,10 @@ impl Amm for ByrealClmm {
             fee_mint: quote_params.input_mint,
             fee_pct: swap_result.fee_rate.into(),
         })
+    }
+
+    fn get_accounts_len(&self) -> usize {
+        17
     }
 
     fn get_swap_and_account_metas(&self, swap_params: &SwapParams) -> Result<SwapAndAccountMetas> {

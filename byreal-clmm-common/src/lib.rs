@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use anyhow::{anyhow, Result};
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use std::collections::HashMap;
 
 use byreal_clmm::libraries::MulDiv;
@@ -17,15 +17,15 @@ use std::collections::BTreeSet;
 // Program IDs
 #[cfg(feature = "mainnet")]
 pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_sdk::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
+    solana_pubkey::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 #[cfg(feature = "devnet")]
 pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_sdk::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
+    solana_pubkey::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
 
 #[cfg(not(any(feature = "mainnet", feature = "devnet")))]
 pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_sdk::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
+    solana_pubkey::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 // Constants
 pub const TICK_ARRAY_SIZE: i32 = 60;
@@ -344,7 +344,7 @@ impl ByrealClmmAmm {
 
         let mut start_indexes: BTreeSet<i32> = BTreeSet::new();
 
-        let mut collect_dir = |zero_for_one: bool, limit: usize, start_indexes: &mut BTreeSet<i32>| {
+        let collect_dir = |zero_for_one: bool, limit: usize, start_indexes: &mut BTreeSet<i32>| {
             if limit == 0 {
                 return;
             }

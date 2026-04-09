@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    "byreal-clmm-jupiter-integration",
-    "byreal-clmm-common"
-]
+members = ["byreal-clmm-jupiter-integration", "byreal-clmm-common"]
 resolver = "2"
 
 [workspace.package]

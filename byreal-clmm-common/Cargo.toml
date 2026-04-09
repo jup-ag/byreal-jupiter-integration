@@ -5,13 +5,15 @@ edition = "2021"
 
 [dependencies]
 # Solana dependencies
-anchor-lang = "0.31.1"
+anchor-lang = "1.0.0"
 anyhow = "1.0.97"
-solana-sdk = "2.3.0"
-solana-program = "2.3.0"
+solana-pubkey = "3.0.0"
+solana-program = "3.0.0"
 
 # Raydium dependencies
-byreal-clmm = { git = "https://github.com/jup-ag/byreal-clmm.git", rev = "cdd7923b2c3bae351ca74eecf8c3c8a88e30328b", features = ["no-entrypoint"] }
+byreal-clmm = { git = "https://github.com/jup-ag/byreal-clmm.git", rev = "99b913b2e7d65a95e88f279a2d85a7cfeeab0df1", features = [
+    "no-entrypoint",
+] }
 bytemuck = { version = "1", features = ["derive"] }
 
 [features]
