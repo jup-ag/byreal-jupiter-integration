@@ -44,7 +44,11 @@ fn dynamic_enabled() -> bool {
 
 fn get_price_feed_account_address(shard_id: u16, feed_id: &[u8; 32]) -> Pubkey {
     let shard_bytes = shard_id.to_le_bytes();
-    Pubkey::find_program_address(&[&shard_bytes, feed_id], &PYTH_RECEIVER_PROGRAM_ID).0
+    Pubkey::find_program_address(
+        &[&shard_bytes, feed_id],
+        &pyth_solana_receiver_sdk::PYTH_PUSH_ORACLE_ID,
+    )
+    .0
 }
 
 fn get_dynamic_pyth_oracle_addresses(pool_state: &PoolState) -> Result<(Pubkey, Pubkey)> {
@@ -232,7 +236,7 @@ impl Amm for ByrealClmm {
 
         accounts.extend(self.amm.get_all_tick_array_addresses());
 
-        if self.amm.pool_state.is_swap_dynamic_fee_enabled() {
+        if dynamic_enabled() && self.amm.pool_state.is_swap_dynamic_fee_enabled() {
             accounts.push(self.amm.pool_state.token_vault_0);
             accounts.push(self.amm.pool_state.token_vault_1);
             if let Ok((token0_pyth_oracle, token1_pyth_oracle)) =
@@ -273,7 +277,7 @@ impl Amm for ByrealClmm {
             }
         }
 
-        if self.amm.pool_state.is_swap_dynamic_fee_enabled() {
+        if dynamic_enabled() && self.amm.pool_state.is_swap_dynamic_fee_enabled() {
             let (token0_pyth_oracle, token1_pyth_oracle) =
                 get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)?;
 
@@ -317,11 +321,6 @@ impl Amm for ByrealClmm {
             if !dynamic_enabled() {
                 return Err(anyhow!("dynamic pool disabled by compile-time feature"));
             }
-            // Keep quote/tx behavior consistent: until Jupiter exposes a swap type
-            // that can encode byreal `swap_v3_dyn`, do not emit executable quotes.
-            return Err(anyhow!(
-                "dynamic CLMM tx path is not supported yet in Jupiter swap type routing"
-            ));
         }
 
         let current_timestamp = self.timestamp.load(std::sync::atomic::Ordering::Relaxed);
@@ -354,12 +353,10 @@ impl Amm for ByrealClmm {
             if !dynamic_enabled() {
                 return Err(anyhow!("dynamic pool disabled by compile-time feature"));
             }
-            // Jupiter AMM interface currently routes this adapter through `Swap::RaydiumClmm`.
-            // Until upstream exposes a dedicated swap_v3_dyn swap type, fail closed instead of
-            // returning metas for an instruction discriminator that the aggregator won't emit.
-            return Err(anyhow!(
-                "dynamic CLMM tx path is not supported yet in Jupiter swap type routing"
-            ));
+            return Ok(SwapAndAccountMetas {
+                swap: Swap::RaydiumClmmV2,
+                account_metas: self.build_swap_v3_dyn_account_metas(swap_params)?,
+            });
         }
 
         let zero_for_one = swap_params.source_mint == self.amm.pool_state.token_mint_0;
@@ -428,7 +425,7 @@ impl Amm for ByrealClmm {
         }
 
         Ok(SwapAndAccountMetas {
-            swap: Swap::RaydiumClmm {},
+            swap: Swap::RaydiumClmm,
             account_metas,
         })
     }
@@ -489,13 +486,9 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "dynamic-pool"))]
     #[test]
     fn test_dynamic_pool_disabled_rejects_quote_and_swap_metas() {
-        assert!(
-            !dynamic_enabled(),
-            "this test requires default build with dynamic-pool feature disabled"
-        );
-
         let mut pool_state = PoolState::default();
         pool_state.token_mint_0 = Pubkey::new_unique();
         pool_state.token_mint_1 = Pubkey::new_unique();
@@ -556,6 +549,23 @@ mod tests {
 
         let err = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap_err();
         assert!(format!("{err:#}").contains("dynamic pool token0 pyth feed id is zero"));
+    }
+
+    #[test]
+    fn test_pyth_price_feed_address_uses_push_oracle_program() {
+        let jup_feed_id =
+            hex_feed_id("0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996");
+        let usdc_feed_id =
+            hex_feed_id("eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a");
+
+        assert_eq!(
+            get_price_feed_account_address(PYTH_PRICE_SHARD_ID, &jup_feed_id),
+            solana_sdk::pubkey!("7dbob1psH1iZBS7qPsm3Kwbf5DzSXK8Jyg31CTgTnxH5")
+        );
+        assert_eq!(
+            get_price_feed_account_address(PYTH_PRICE_SHARD_ID, &usdc_feed_id),
+            solana_sdk::pubkey!("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX")
+        );
     }
 
     #[test]
@@ -660,6 +670,90 @@ mod tests {
             .contains("directional first tick array account missing for dynamic swap"));
     }
 
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_feature_on_returns_quote_and_swap_v2_route() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.sqrt_price_x64 =
+            byreal_clmm_common::tick_math::get_sqrt_price_at_tick(0).unwrap();
+        amm.amm.pool_state.tick_current = 0;
+        amm.amm.pool_state.tick_spacing = 1;
+        amm.amm.pool_state.liquidity = 1_000_000_000;
+        amm.amm.pool_state.mint_decimals_0 = 6;
+        amm.amm.pool_state.mint_decimals_1 = 6;
+        amm.amm.pool_state.set_quote_token_flag(true);
+        amm.amm.pool_state.open_time = 0;
+        amm.amm.pool_state.arbitrage_fee_buffer_ppm = 10_000;
+        amm.amm.pool_state.trade_slippage_fee_base = 50;
+        amm.amm.pool_state.trade_slippage_fee_trade_size_threshold = 1;
+        amm.amm.pool_state.imbalance_fee_base = 20;
+        amm.amm.pool_state.imbalance_fee_x = 50;
+        amm.amm.amm_config.trade_fee_rate = 1_200;
+        amm.amm.token0_vault_amount = 5_000_000_000;
+        amm.amm.token1_vault_amount = 500_000_000;
+        amm.amm.token0_pyth_price = Some(Price {
+            price: 100_000_000,
+            conf: 1,
+            exponent: -8,
+            publish_time: 100,
+        });
+        amm.amm.token1_pyth_price = Some(Price {
+            price: 1_000_000,
+            conf: 1,
+            exponent: -6,
+            publish_time: 100,
+        });
+        amm.timestamp.store(200, std::sync::atomic::Ordering::Relaxed);
+
+        let current_start = 0;
+        amm.amm
+            .pool_state
+            .flip_tick_array_bit_internal(current_start)
+            .unwrap();
+        let mut tick_array = TickArrayState::default();
+        tick_array.pool_id = amm.key;
+        tick_array.start_tick_index = current_start;
+        tick_array.ticks[1].tick = 1;
+        tick_array.ticks[1].liquidity_gross = 1;
+        tick_array.initialized_tick_count = 1;
+        let current_tick_array = amm.amm.get_tick_array_address(current_start);
+        amm.amm.dynamic_tick_arrays.insert(
+            current_tick_array,
+            DynamicTickArrayState::Fixed(tick_array),
+        );
+
+        let quote = amm
+            .quote(&QuoteParams {
+                amount: 1_000,
+                input_mint: amm.amm.pool_state.token_mint_1,
+                output_mint: amm.amm.pool_state.token_mint_0,
+                swap_mode: SwapMode::ExactIn,
+            })
+            .unwrap();
+        assert_eq!(quote.in_amount, 1_000);
+        assert!(quote.out_amount > 0);
+        assert!(quote.fee_amount > 0);
+
+        let jupiter_program = Pubkey::new_unique();
+        let swap = amm
+            .get_swap_and_account_metas(&SwapParams {
+                source_mint: amm.amm.pool_state.token_mint_1,
+                destination_mint: amm.amm.pool_state.token_mint_0,
+                source_token_account: Pubkey::new_unique(),
+                destination_token_account: Pubkey::new_unique(),
+                token_transfer_authority: Pubkey::new_unique(),
+                quote_mint_to_referrer: None,
+                jupiter_program_id: &jupiter_program,
+                in_amount: quote.in_amount,
+                out_amount: quote.out_amount,
+                missing_dynamic_accounts_as_default: false,
+                swap_mode: SwapMode::ExactIn,
+            })
+            .unwrap();
+        assert_eq!(swap.swap, Swap::RaydiumClmmV2);
+        assert_eq!(swap.account_metas[14].pubkey, current_tick_array);
+    }
+
     #[test]
     fn test_decode_vault_amount_supports_spl_and_token_2022() {
         let mut spl_vault = spl_token::state::Account::default();
@@ -686,4 +780,11 @@ mod tests {
         assert!(format!("{err:#}").contains("unsupported token vault owner"));
     }
 
+    fn hex_feed_id(value: &str) -> [u8; 32] {
+        let mut feed_id = [0u8; 32];
+        for i in 0..32 {
+            feed_id[i] = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        feed_id
+    }
 }

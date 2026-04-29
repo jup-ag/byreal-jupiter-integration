@@ -37,7 +37,7 @@ fn live_dev_dynamic_pool_flag_off_rejects_quote_after_loading_required_accounts(
 #[cfg(feature = "dynamic-pool")]
 #[test]
 #[ignore]
-fn live_dev_dynamic_pool_flag_on_still_fails_closed_until_swap_v3_dyn_route_exists() {
+fn live_dev_dynamic_pool_flag_on_enters_real_quote_path() {
     let loaded = load_dynamic_pool();
     let err = loaded
         .amm
@@ -50,7 +50,7 @@ fn live_dev_dynamic_pool_flag_on_still_fails_closed_until_swap_v3_dyn_route_exis
         .unwrap_err();
 
     println!("quote error: {err:#}");
-    assert!(format!("{err:#}").contains("dynamic CLMM tx path is not supported yet"));
+    assert!(format!("{err:#}").contains("dynamic fee token0 pyth price missing"));
 }
 
 fn load_dynamic_pool() -> LoadedDynamicPool {
@@ -90,11 +90,18 @@ fn load_dynamic_pool() -> LoadedDynamicPool {
     let amm = ByrealClmm::from_keyed_account(&keyed_account, &AmmContext { clock_ref }).unwrap();
 
     let accounts_to_update = amm.get_accounts_to_update();
-    assert!(accounts_to_update.contains(&pool_state.token_vault_0));
-    assert!(accounts_to_update.contains(&pool_state.token_vault_1));
     assert!(accounts_to_update.contains(&TickArrayBitmapExtension::key(pool_address)));
-    assert!(accounts_to_update.contains(&pyth_price_feed_address(&pool_state.token0_pyth_feed_id)));
-    assert!(accounts_to_update.contains(&pyth_price_feed_address(&pool_state.token1_pyth_feed_id)));
+    if cfg!(feature = "dynamic-pool") {
+        assert!(accounts_to_update.contains(&pool_state.token_vault_0));
+        assert!(accounts_to_update.contains(&pool_state.token_vault_1));
+        assert!(accounts_to_update.contains(&pyth_price_feed_address(&pool_state.token0_pyth_feed_id)));
+        assert!(accounts_to_update.contains(&pyth_price_feed_address(&pool_state.token1_pyth_feed_id)));
+    } else {
+        assert!(!accounts_to_update.contains(&pool_state.token_vault_0));
+        assert!(!accounts_to_update.contains(&pool_state.token_vault_1));
+        assert!(!accounts_to_update.contains(&pyth_price_feed_address(&pool_state.token0_pyth_feed_id)));
+        assert!(!accounts_to_update.contains(&pyth_price_feed_address(&pool_state.token1_pyth_feed_id)));
+    }
 
     let accounts = rpc.get_multiple_accounts(&accounts_to_update).unwrap();
     let missing_accounts = accounts_to_update
@@ -119,5 +126,9 @@ fn load_dynamic_pool() -> LoadedDynamicPool {
 }
 
 fn pyth_price_feed_address(feed_id: &[u8; 32]) -> Pubkey {
-    Pubkey::find_program_address(&[&0u16.to_le_bytes(), feed_id], &pyth_solana_receiver_sdk::ID).0
+    Pubkey::find_program_address(
+        &[&0u16.to_le_bytes(), feed_id],
+        &pyth_solana_receiver_sdk::PYTH_PUSH_ORACLE_ID,
+    )
+    .0
 }

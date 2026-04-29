@@ -7,6 +7,8 @@ use byreal_clmm_common::{
 };
 use byreal_clmm_jupiter_integration::{ByrealClmm, BYREAL_CLMM_PROGRAM};
 use jupiter_amm_interface::{AccountMap, Amm, AmmContext, ClockRef, KeyedAccount, QuoteParams, SwapMode};
+#[cfg(feature = "dynamic-pool")]
+use jupiter_amm_interface::{Swap, SwapParams};
 use litesvm::LiteSVM;
 use solana_account::Account as RawAccount;
 use solana_account::ReadableAccount;
@@ -19,10 +21,9 @@ use solana_sdk::account::Account as SdkAccount;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction::Transaction as RawTransaction;
 use spl_token::solana_program::program_pack::Pack;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::atomic::Ordering,
-};
+use std::{collections::{HashMap, HashSet}, sync::atomic::Ordering};
+#[cfg(feature = "dynamic-pool")]
+use std::sync::Mutex;
 
 const LEGACY_PROGRAM: Pubkey = solana_sdk::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
 const LEGACY_POOL: Pubkey = solana_sdk::pubkey!("J4jiEPEu8c8nLdpkiMa7k1P8rL1HCJSNxCvzA5DsmYds");
@@ -33,6 +34,14 @@ const MAINNET_USDC_MINT: Pubkey =
     solana_sdk::pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 const MAINNET_CBBTC_MINT: Pubkey =
     solana_sdk::pubkey!("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij");
+#[cfg(feature = "dynamic-pool")]
+const DYNAMIC_JUP_USDC_POOL: Pubkey =
+    solana_sdk::pubkey!("DCiq2T2tMxdRgoQ2jQ9JhCNaMU5TxsPdrCa7esSCvxiw");
+#[cfg(feature = "dynamic-pool")]
+const JUP_MINT: Pubkey =
+    solana_sdk::pubkey!("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN");
+#[cfg(feature = "dynamic-pool")]
+static LIVE_RPC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct LoadedPool {
     pool_address: Pubkey,
@@ -273,6 +282,222 @@ fn litesvm_vs_sdk_mainnet_cbbtc_usdc_exact_out() {
 
     assert_amounts_close(
         "mainnet exact-out input amount",
+        sdk_quote.in_amount,
+        sim_result.source_debit,
+    );
+    assert_eq!(sim_result.destination_amount, desired_out);
+}
+
+#[cfg(feature = "dynamic-pool")]
+#[test]
+#[ignore]
+fn litesvm_vs_sdk_dynamic_jup_usdc_exact_in() {
+    let _guard = LIVE_RPC_TEST_LOCK.lock().unwrap();
+    if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
+        println!("Skipping dynamic pool LiteSVM test: compile with --features \"devnet dynamic-pool with-litesvm\"");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, DYNAMIC_JUP_USDC_POOL, LEGACY_PROGRAM).unwrap();
+    assert!(loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+    let amount_in = 1_000_000u64;
+
+    let sdk_quote = loaded
+        .adapter
+        .quote(&QuoteParams {
+            amount: amount_in,
+            input_mint: MAINNET_USDC_MINT,
+            output_mint: JUP_MINT,
+            swap_mode: SwapMode::ExactIn,
+        })
+        .unwrap();
+    println!(
+        "Dynamic SDK quote: in={}, out={}, fee={}",
+        sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+    );
+
+    let sim_result = simulate_swap_v3_dyn(
+        &rpc,
+        &loaded,
+        MAINNET_USDC_MINT,
+        JUP_MINT,
+        amount_in,
+        0,
+        true,
+        amount_in.saturating_mul(2),
+    )
+    .unwrap();
+    println!(
+        "Dynamic LiteSVM out={}, diff (sdk_math - litesvm)={}",
+        sim_result.destination_amount,
+        sdk_quote.out_amount.saturating_sub(sim_result.destination_amount)
+    );
+
+    assert_amounts_close(
+        "dynamic exact-in output amount",
+        sdk_quote.out_amount,
+        sim_result.destination_amount,
+    );
+}
+
+#[cfg(feature = "dynamic-pool")]
+#[test]
+#[ignore]
+fn litesvm_vs_sdk_dynamic_jup_usdc_exact_out() {
+    let _guard = LIVE_RPC_TEST_LOCK.lock().unwrap();
+    if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
+        println!("Skipping dynamic pool LiteSVM test: compile with --features \"devnet dynamic-pool with-litesvm\"");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, DYNAMIC_JUP_USDC_POOL, LEGACY_PROGRAM).unwrap();
+    assert!(loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+    let desired_out = 1_000_000u64;
+
+    let sdk_quote = loaded
+        .adapter
+        .quote(&QuoteParams {
+            amount: desired_out,
+            input_mint: MAINNET_USDC_MINT,
+            output_mint: JUP_MINT,
+            swap_mode: SwapMode::ExactOut,
+        })
+        .unwrap();
+    println!(
+        "Dynamic SDK exact-out quote: in={}, out={}, fee={}",
+        sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+    );
+
+    let sim_result = simulate_swap_v3_dyn(
+        &rpc,
+        &loaded,
+        MAINNET_USDC_MINT,
+        JUP_MINT,
+        desired_out,
+        sdk_quote.in_amount,
+        false,
+        sdk_quote.in_amount.saturating_mul(2),
+    )
+    .unwrap();
+    println!(
+        "Dynamic LiteSVM exact-out in={}, out={}, diff (sdk_in - litesvm_in)={}",
+        sim_result.source_debit,
+        sim_result.destination_amount,
+        sdk_quote.in_amount.saturating_sub(sim_result.source_debit)
+    );
+
+    assert_amounts_close(
+        "dynamic exact-out input amount",
+        sdk_quote.in_amount,
+        sim_result.source_debit,
+    );
+    assert_eq!(sim_result.destination_amount, desired_out);
+}
+
+#[cfg(feature = "dynamic-pool")]
+#[test]
+#[ignore]
+fn litesvm_vs_sdk_dynamic_jup_usdc_reverse_exact_in() {
+    let _guard = LIVE_RPC_TEST_LOCK.lock().unwrap();
+    if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
+        println!("Skipping dynamic pool LiteSVM test: compile with --features \"devnet dynamic-pool with-litesvm\"");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, DYNAMIC_JUP_USDC_POOL, LEGACY_PROGRAM).unwrap();
+    assert!(loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+    let amount_in = 1_000_000u64;
+
+    let sdk_quote = loaded
+        .adapter
+        .quote(&QuoteParams {
+            amount: amount_in,
+            input_mint: JUP_MINT,
+            output_mint: MAINNET_USDC_MINT,
+            swap_mode: SwapMode::ExactIn,
+        })
+        .unwrap();
+    println!(
+        "Dynamic reverse SDK quote: in={}, out={}, fee={}",
+        sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+    );
+
+    let sim_result = simulate_swap_v3_dyn(
+        &rpc,
+        &loaded,
+        JUP_MINT,
+        MAINNET_USDC_MINT,
+        amount_in,
+        0,
+        true,
+        amount_in.saturating_mul(2),
+    )
+    .unwrap();
+    println!(
+        "Dynamic reverse LiteSVM out={}, diff (sdk_math - litesvm)={}",
+        sim_result.destination_amount,
+        sdk_quote.out_amount.saturating_sub(sim_result.destination_amount)
+    );
+
+    assert_amounts_close(
+        "dynamic reverse exact-in output amount",
+        sdk_quote.out_amount,
+        sim_result.destination_amount,
+    );
+}
+
+#[cfg(feature = "dynamic-pool")]
+#[test]
+#[ignore]
+fn litesvm_vs_sdk_dynamic_jup_usdc_reverse_exact_out() {
+    let _guard = LIVE_RPC_TEST_LOCK.lock().unwrap();
+    if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
+        println!("Skipping dynamic pool LiteSVM test: compile with --features \"devnet dynamic-pool with-litesvm\"");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, DYNAMIC_JUP_USDC_POOL, LEGACY_PROGRAM).unwrap();
+    assert!(loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+    let desired_out = 1_000_000u64;
+
+    let sdk_quote = loaded
+        .adapter
+        .quote(&QuoteParams {
+            amount: desired_out,
+            input_mint: JUP_MINT,
+            output_mint: MAINNET_USDC_MINT,
+            swap_mode: SwapMode::ExactOut,
+        })
+        .unwrap();
+    println!(
+        "Dynamic reverse SDK exact-out quote: in={}, out={}, fee={}",
+        sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+    );
+
+    let sim_result = simulate_swap_v3_dyn(
+        &rpc,
+        &loaded,
+        JUP_MINT,
+        MAINNET_USDC_MINT,
+        desired_out,
+        sdk_quote.in_amount,
+        false,
+        sdk_quote.in_amount.saturating_mul(2),
+    )
+    .unwrap();
+    println!(
+        "Dynamic reverse LiteSVM exact-out in={}, out={}, diff (sdk_in - litesvm_in)={}",
+        sim_result.source_debit,
+        sim_result.destination_amount,
+        sdk_quote.in_amount.saturating_sub(sim_result.source_debit)
+    );
+
+    assert_amounts_close(
+        "dynamic reverse exact-out input amount",
         sdk_quote.in_amount,
         sim_result.source_debit,
     );
@@ -548,6 +773,115 @@ fn simulate_legacy_swap(
     })
 }
 
+#[cfg(feature = "dynamic-pool")]
+fn simulate_swap_v3_dyn(
+    rpc: &RpcClient,
+    loaded: &LoadedPool,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+    amount: u64,
+    other_amount_threshold: u64,
+    is_base_input: bool,
+    source_balance: u64,
+) -> Result<SimResult> {
+    let mut svm = LiteSVM::new()
+        .with_sysvars()
+        .with_builtins()
+        .with_default_programs()
+        .with_sigverify(false)
+        .with_blockhash_check(false);
+
+    let program_bytes = deployed_program_bytes(rpc, &BYREAL_CLMM_PROGRAM)?;
+    let clmm_program = RawPubkey::new_from_array(BYREAL_CLMM_PROGRAM.to_bytes());
+    svm.add_program(clmm_program, &program_bytes).unwrap();
+
+    for (addr, acc) in loaded.account_map.iter() {
+        svm.set_account(RawPubkey::new_from_array(addr.to_bytes()), to_raw_account(acc))
+            .unwrap();
+    }
+    for address in [input_mint, output_mint] {
+        if !loaded.account_map.contains_key(&address) {
+            let account = rpc.get_account(&address)?;
+            svm.set_account(RawPubkey::new_from_array(address.to_bytes()), to_raw_account(&account))
+                .unwrap();
+        }
+    }
+
+    let user = Pubkey::new_unique();
+    let source_token_account = Pubkey::new_unique();
+    let destination_token_account = Pubkey::new_unique();
+    for (address, mint, token_amount) in [
+        (source_token_account, input_mint, source_balance),
+        (destination_token_account, output_mint, 0),
+    ] {
+        svm.set_account(
+            RawPubkey::new_from_array(address.to_bytes()),
+            RawAccount {
+                lamports: 1_000_000_000,
+                data: spl_token_account_data(mint, user, token_amount),
+                owner: RawPubkey::new_from_array(anchor_spl::token::ID.to_bytes()),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+    let user_raw = RawPubkey::new_from_array(user.to_bytes());
+    svm.airdrop(&user_raw, 1_000_000_000).unwrap();
+
+    let mut clock_sysvar: RawClock = svm.get_sysvar();
+    clock_sysvar.unix_timestamp = loaded.swap_timestamp;
+    svm.set_sysvar(&clock_sysvar);
+
+    let swap = loaded.adapter.get_swap_and_account_metas(&SwapParams {
+        source_mint: input_mint,
+        destination_mint: output_mint,
+        source_token_account,
+        destination_token_account,
+        token_transfer_authority: user,
+        quote_mint_to_referrer: None,
+        jupiter_program_id: &Pubkey::new_unique(),
+        in_amount: if is_base_input { amount } else { other_amount_threshold },
+        out_amount: if is_base_input { other_amount_threshold } else { amount },
+        missing_dynamic_accounts_as_default: false,
+        swap_mode: if is_base_input {
+            SwapMode::ExactIn
+        } else {
+            SwapMode::ExactOut
+        },
+    })?;
+    assert_eq!(swap.swap, Swap::RaydiumClmmV2);
+
+    let mut data = swap_v3_dyn_discriminator().to_vec();
+    data.extend(serialize_swap_ix_args(&SwapIxArgs {
+        amount,
+        other_amount_threshold,
+        sqrt_price_limit_x64: 0,
+        is_base_input,
+    }));
+
+    let raw_ix = RawInstruction {
+        program_id: clmm_program,
+        accounts: swap
+            .account_metas
+            .iter()
+            .map(raw_meta_from_sdk)
+            .collect::<Vec<_>>(),
+        data,
+    };
+    let tx = RawTransaction::new_unsigned(RawMessage::new(&[raw_ix], Some(&user_raw)));
+    let sim = svm
+        .simulate_transaction(tx)
+        .map_err(|e| anyhow!("dynamic LiteSVM simulate_transaction failed: {e:?}"))?;
+
+    let source_post = post_token_amount(&sim.post_accounts, source_token_account)?;
+    let destination_post = post_token_amount(&sim.post_accounts, destination_token_account)?;
+    Ok(SimResult {
+        source_debit: source_balance.saturating_sub(source_post),
+        destination_amount: destination_post,
+    })
+}
+
 fn to_raw_account(account: &SdkAccount) -> RawAccount {
     RawAccount {
         lamports: account.lamports,
@@ -573,6 +907,21 @@ fn raw_meta(pubkey: Pubkey, is_signer: bool, is_writable: bool) -> RawAccountMet
         is_signer,
         is_writable,
     }
+}
+
+#[cfg(feature = "dynamic-pool")]
+fn raw_meta_from_sdk(meta: &solana_sdk::instruction::AccountMeta) -> RawAccountMeta {
+    RawAccountMeta {
+        pubkey: RawPubkey::new_from_array(meta.pubkey.to_bytes()),
+        is_signer: meta.is_signer,
+        is_writable: meta.is_writable,
+    }
+}
+
+#[cfg(feature = "dynamic-pool")]
+fn swap_v3_dyn_discriminator() -> [u8; 8] {
+    let hash = solana_program::hash::hash(b"global:swap_v3_dyn").to_bytes();
+    hash[..8].try_into().unwrap()
 }
 
 fn post_token_amount(

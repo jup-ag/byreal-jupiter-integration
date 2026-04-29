@@ -1,9 +1,10 @@
 use anchor_lang::{AccountDeserialize, Discriminator};
-use byreal_clmm_common::{PoolState, TickArrayBitmapExtension};
+use byreal_clmm_common::PoolState;
 use byreal_clmm_jupiter_integration::{ByrealClmm, BYREAL_CLMM_PROGRAM};
 use jupiter_amm_interface::{Amm, AmmContext, KeyedAccount, QuoteParams, SwapMode, SwapParams};
 use solana_sdk::{account::Account, pubkey::Pubkey};
 
+#[cfg(feature = "dynamic-pool")]
 #[test]
 fn dynamic_pool_accounts_to_update_include_vaults_and_pyth_oracles() {
     let (amm, pool_state) = dynamic_test_amm();
@@ -11,15 +12,28 @@ fn dynamic_pool_accounts_to_update_include_vaults_and_pyth_oracles() {
 
     assert!(accounts.contains(&pool_state.token_vault_0));
     assert!(accounts.contains(&pool_state.token_vault_1));
-    assert!(accounts.contains(&TickArrayBitmapExtension::key(amm.key())));
+    assert!(accounts.contains(&byreal_clmm_common::TickArrayBitmapExtension::key(amm.key())));
     assert!(accounts.contains(&pyth_price_feed_address(&pool_state.token0_pyth_feed_id)));
     assert!(accounts.contains(&pyth_price_feed_address(&pool_state.token1_pyth_feed_id)));
 }
 
 #[cfg(not(feature = "dynamic-pool"))]
 #[test]
-fn dynamic_pool_rejects_quote_and_swap_metas_when_sdk_flag_off() {
+fn dynamic_pool_accounts_to_update_omit_vaults_and_pyth_oracles_when_flag_off() {
     let (amm, pool_state) = dynamic_test_amm();
+    let accounts = amm.get_accounts_to_update();
+
+    assert!(!accounts.contains(&pool_state.token_vault_0));
+    assert!(!accounts.contains(&pool_state.token_vault_1));
+    assert!(!accounts.contains(&pyth_price_feed_address(&pool_state.token0_pyth_feed_id)));
+    assert!(!accounts.contains(&pyth_price_feed_address(&pool_state.token1_pyth_feed_id)));
+}
+
+#[cfg(not(feature = "dynamic-pool"))]
+#[test]
+fn dynamic_pool_rejects_quote_and_swap_metas_when_sdk_flag_off() {
+    let (mut amm, pool_state) = dynamic_test_amm();
+    amm.update(&dynamic_update_account_map(amm.key(), &pool_state)).unwrap();
 
     let quote_err = amm
         .quote(&QuoteParams {
@@ -54,7 +68,7 @@ fn dynamic_pool_rejects_quote_and_swap_metas_when_sdk_flag_off() {
 
 #[cfg(feature = "dynamic-pool")]
 #[test]
-fn dynamic_pool_feature_on_still_fails_closed_until_swap_v3_dyn_route_exists() {
+fn dynamic_pool_feature_on_enters_real_quote_and_swap_paths() {
     let (amm, pool_state) = dynamic_test_amm();
 
     let quote_err = amm
@@ -65,8 +79,8 @@ fn dynamic_pool_feature_on_still_fails_closed_until_swap_v3_dyn_route_exists() {
             swap_mode: SwapMode::ExactIn,
         })
         .err()
-        .expect("dynamic pool route should fail closed");
-    assert!(format!("{quote_err:#}").contains("dynamic CLMM tx path is not supported yet"));
+        .expect("mock dynamic pool should still error without loaded pyth prices");
+    assert!(format!("{quote_err:#}").contains("dynamic fee token0 pyth price missing"));
 
     let jupiter_program = Pubkey::new_unique();
     let swap_err = amm
@@ -84,8 +98,9 @@ fn dynamic_pool_feature_on_still_fails_closed_until_swap_v3_dyn_route_exists() {
             swap_mode: SwapMode::ExactIn,
         })
         .err()
-        .expect("dynamic pool route should fail closed");
-    assert!(format!("{swap_err:#}").contains("dynamic CLMM tx path is not supported yet"));
+        .expect("mock dynamic pool should still error without loaded tick arrays");
+    assert!(format!("{swap_err:#}")
+        .contains("directional first tick array account missing for dynamic swap"));
 }
 
 fn dynamic_test_amm() -> (ByrealClmm, PoolState) {
@@ -134,6 +149,46 @@ fn pool_state_account_data(pool_state: &PoolState) -> Vec<u8> {
     data
 }
 
+#[cfg(not(feature = "dynamic-pool"))]
+fn amm_config_account_data(config: &byreal_clmm_common::AmmConfig) -> Vec<u8> {
+    let mut data = Vec::new();
+    anchor_lang::AccountSerialize::try_serialize(config, &mut data).unwrap();
+    data
+}
+
+#[cfg(not(feature = "dynamic-pool"))]
+fn dynamic_update_account_map(
+    pool_key: Pubkey,
+    pool_state: &PoolState,
+) -> jupiter_amm_interface::AccountMap {
+    let mut account_map = jupiter_amm_interface::AccountMap::default();
+    account_map.insert(
+        pool_key,
+        Account {
+            lamports: 1_000_000,
+            data: pool_state_account_data(pool_state),
+            owner: BYREAL_CLMM_PROGRAM,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    account_map.insert(
+        pool_state.amm_config,
+        Account {
+            lamports: 1_000_000,
+            data: amm_config_account_data(&byreal_clmm_common::AmmConfig::default()),
+            owner: BYREAL_CLMM_PROGRAM,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    account_map
+}
+
 fn pyth_price_feed_address(feed_id: &[u8; 32]) -> Pubkey {
-    Pubkey::find_program_address(&[&0u16.to_le_bytes(), feed_id], &pyth_solana_receiver_sdk::ID).0
+    Pubkey::find_program_address(
+        &[&0u16.to_le_bytes(), feed_id],
+        &pyth_solana_receiver_sdk::PYTH_PUSH_ORACLE_ID,
+    )
+    .0
 }
