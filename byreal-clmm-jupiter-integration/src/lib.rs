@@ -152,11 +152,21 @@ impl ByrealClmm {
         &self,
         swap_params: &SwapParams,
     ) -> Result<Vec<AccountMeta>> {
+        let mut account_metas = self.build_swap_v2_account_metas(swap_params)?;
+
+        if self.amm.pool_state.is_swap_dynamic_fee_enabled() {
+            let (token0_pyth_oracle, token1_pyth_oracle) =
+                get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)?;
+            account_metas.push(AccountMeta::new_readonly(token0_pyth_oracle, false));
+            account_metas.push(AccountMeta::new_readonly(token1_pyth_oracle, false));
+        }
+
+        Ok(account_metas)
+    }
+
+    fn build_swap_v2_account_metas(&self, swap_params: &SwapParams) -> Result<Vec<AccountMeta>> {
         let zero_for_one =
             self.swap_direction_for_mints(swap_params.source_mint, swap_params.destination_mint)?;
-
-        let (token0_pyth_oracle, token1_pyth_oracle) =
-            get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)?;
         let live_tick_arrays = self.live_directional_tick_arrays(zero_for_one)?;
 
         let mut account_metas = vec![
@@ -198,8 +208,6 @@ impl ByrealClmm {
         for address in live_tick_arrays {
             account_metas.push(AccountMeta::new(address, false));
         }
-        account_metas.push(AccountMeta::new_readonly(token0_pyth_oracle, false));
-        account_metas.push(AccountMeta::new_readonly(token1_pyth_oracle, false));
 
         Ok(account_metas)
     }
@@ -393,75 +401,16 @@ impl Amm for ByrealClmm {
             });
         }
 
-        let zero_for_one =
-            self.swap_direction_for_mints(swap_params.source_mint, swap_params.destination_mint)?;
-
-        // Build account metas for swap instruction (must match on-chain order)
-        let mut account_metas = vec![
-            // Signer (payer)
-            AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
-            // AMM Config
-            AccountMeta::new_readonly(self.amm.pool_state.amm_config, false),
-            // Pool state
-            AccountMeta::new(self.key, false),
-            // User token accounts (input, output)
-            AccountMeta::new(swap_params.source_token_account, false),
-            AccountMeta::new(swap_params.destination_token_account, false),
-            // Vaults (input, output)
-            if zero_for_one {
-                AccountMeta::new(self.amm.pool_state.token_vault_0, false)
-            } else {
-                AccountMeta::new(self.amm.pool_state.token_vault_1, false)
-            },
-            if zero_for_one {
-                AccountMeta::new(self.amm.pool_state.token_vault_1, false)
-            } else {
-                AccountMeta::new(self.amm.pool_state.token_vault_0, false)
-            },
-            // Observation state
-            AccountMeta::new(self.amm.pool_state.observation_key, false),
-            // Token program
-            AccountMeta::new_readonly(anchor_spl::token::ID, false),
-        ];
-
-        // Tick arrays for this swap:
-        // - start from directional candidates from get_swap_tick_arrays;
-        // - keep only those for which we actually have account bytes loaded
-        //   (so they are present in tick_arrays_raw and thus in LiteSVM);
-        // - if none of the directional candidates are present, fall back to
-        //   *any* tick arrays we have in tick_arrays_raw.
-        let candidate_tick_arrays = self.amm.get_swap_tick_arrays(zero_for_one);
-        let mut live_tick_arrays: Vec<Pubkey> = candidate_tick_arrays
-            .into_iter()
-            .filter(|addr| self.amm.dynamic_tick_arrays.contains_key(addr))
-            .collect();
-
-        if live_tick_arrays.is_empty() {
-            live_tick_arrays.extend(self.amm.dynamic_tick_arrays.keys().copied());
-        }
-
-        if live_tick_arrays.is_empty() {
-            return Err(anyhow!(
-                "No tick array accounts available for swap; cannot build account metas"
-            ));
-        }
-
-        // Primary tick array (named account in Anchor context)
-        let primary_tick_array = live_tick_arrays[0];
-        account_metas.push(AccountMeta::new(primary_tick_array, false));
-
-        // Bitmap extension (readonly) to support out-of-bound bitmaps
-        let bitmap_key = TickArrayBitmapExtension::key(self.key);
-        account_metas.push(AccountMeta::new_readonly(bitmap_key, false));
-
-        // Additional tick arrays as remaining accounts
-        for addr in live_tick_arrays.iter().skip(1) {
-            account_metas.push(AccountMeta::new(*addr, false));
+        if dynamic_enabled() {
+            return Ok(SwapAndAccountMetas {
+                swap: Swap::RaydiumClmmV2,
+                account_metas: self.build_swap_v3_dyn_account_metas(swap_params)?,
+            });
         }
 
         Ok(SwapAndAccountMetas {
-            swap: Swap::RaydiumClmm,
-            account_metas,
+            swap: Swap::RaydiumClmmV2,
+            account_metas: self.build_swap_v2_account_metas(swap_params)?,
         })
     }
 
@@ -634,6 +583,77 @@ mod tests {
     }
 
     #[test]
+    fn test_non_dynamic_pool_returns_v2_compatible_metas() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.set_swap_dynamic_fee_enabled(false);
+        let first_tick_array = amm.amm.get_swap_tick_arrays(true)[0];
+        amm.amm.dynamic_tick_arrays.insert(
+            first_tick_array,
+            DynamicTickArrayState::Fixed(TickArrayState::default()),
+        );
+
+        let jupiter_program = Pubkey::new_unique();
+        let swap_params = SwapParams {
+            source_mint: amm.amm.pool_state.token_mint_0,
+            destination_mint: amm.amm.pool_state.token_mint_1,
+            source_token_account: Pubkey::new_unique(),
+            destination_token_account: Pubkey::new_unique(),
+            token_transfer_authority: Pubkey::new_unique(),
+            quote_mint_to_referrer: None,
+            jupiter_program_id: &jupiter_program,
+            in_amount: 1_000,
+            out_amount: 1,
+            missing_dynamic_accounts_as_default: false,
+            swap_mode: SwapMode::ExactIn,
+        };
+
+        let swap = amm.get_swap_and_account_metas(&swap_params).unwrap();
+
+        assert_eq!(swap.swap, Swap::RaydiumClmmV2);
+        assert_eq!(swap.account_metas[9].pubkey, spl_token_2022::ID);
+        assert_eq!(swap.account_metas[10].pubkey, anchor_spl::memo::ID);
+        assert_eq!(swap.account_metas[11].pubkey, amm.amm.pool_state.token_mint_0);
+        assert_eq!(swap.account_metas[12].pubkey, amm.amm.pool_state.token_mint_1);
+        assert_eq!(swap.account_metas[13].pubkey, TickArrayBitmapExtension::key(amm.key));
+        assert_eq!(swap.account_metas[14].pubkey, first_tick_array);
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_non_dynamic_pool_feature_on_does_not_require_pyth_metas() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.set_swap_dynamic_fee_enabled(false);
+        amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
+        amm.amm.pool_state.token1_pyth_feed_id = [0u8; 32];
+        let first_tick_array = amm.amm.get_swap_tick_arrays(true)[0];
+        amm.amm.dynamic_tick_arrays.insert(
+            first_tick_array,
+            DynamicTickArrayState::Fixed(TickArrayState::default()),
+        );
+
+        let jupiter_program = Pubkey::new_unique();
+        let swap = amm
+            .get_swap_and_account_metas(&SwapParams {
+                source_mint: amm.amm.pool_state.token_mint_0,
+                destination_mint: amm.amm.pool_state.token_mint_1,
+                source_token_account: Pubkey::new_unique(),
+                destination_token_account: Pubkey::new_unique(),
+                token_transfer_authority: Pubkey::new_unique(),
+                quote_mint_to_referrer: None,
+                jupiter_program_id: &jupiter_program,
+                in_amount: 1_000,
+                out_amount: 1,
+                missing_dynamic_accounts_as_default: false,
+                swap_mode: SwapMode::ExactIn,
+            })
+            .unwrap();
+
+        assert_eq!(swap.swap, Swap::RaydiumClmmV2);
+        assert_eq!(swap.account_metas.len(), 15);
+        assert_eq!(swap.account_metas[14].pubkey, first_tick_array);
+    }
+
+    #[test]
     fn test_pyth_price_feed_address_uses_push_oracle_program() {
         let jup_feed_id =
             hex_feed_id("0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996");
@@ -754,7 +774,7 @@ mod tests {
 
     #[cfg(feature = "dynamic-pool")]
     #[test]
-    fn test_dynamic_pool_feature_on_returns_quote_and_swap_v2_route() {
+    fn test_dynamic_pool_feature_on_returns_quote_and_swap_v3_dyn_route() {
         let mut amm = build_dynamic_test_amm();
         amm.amm.pool_state.sqrt_price_x64 =
             byreal_clmm_common::tick_math::get_sqrt_price_at_tick(0).unwrap();
@@ -834,6 +854,10 @@ mod tests {
             .unwrap();
         assert_eq!(swap.swap, Swap::RaydiumClmmV2);
         assert_eq!(swap.account_metas[14].pubkey, current_tick_array);
+        let (token0_pyth_oracle, token1_pyth_oracle) =
+            get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap();
+        assert_eq!(swap.account_metas[swap.account_metas.len() - 2].pubkey, token0_pyth_oracle);
+        assert_eq!(swap.account_metas[swap.account_metas.len() - 1].pubkey, token1_pyth_oracle);
     }
 
     #[test]

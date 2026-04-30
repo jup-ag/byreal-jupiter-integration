@@ -6,9 +6,9 @@ use byreal_clmm_common::{
     AmmConfig, ByrealClmmAmm, DynamicTickArrayState, PoolState, TickArrayBitmapExtension,
 };
 use byreal_clmm_jupiter_integration::{ByrealClmm, BYREAL_CLMM_PROGRAM};
-use jupiter_amm_interface::{AccountMap, Amm, AmmContext, ClockRef, KeyedAccount, QuoteParams, SwapMode};
-#[cfg(feature = "dynamic-pool")]
-use jupiter_amm_interface::{Swap, SwapParams};
+use jupiter_amm_interface::{
+    AccountMap, Amm, AmmContext, ClockRef, KeyedAccount, QuoteParams, Swap, SwapMode, SwapParams,
+};
 use litesvm::LiteSVM;
 use solana_account::Account as RawAccount;
 use solana_account::ReadableAccount;
@@ -21,26 +21,27 @@ use solana_sdk::account::Account as SdkAccount;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction::Transaction as RawTransaction;
 use spl_token::solana_program::program_pack::Pack;
-use std::{collections::{HashMap, HashSet}, sync::atomic::Ordering};
-#[cfg(feature = "dynamic-pool")]
-use std::sync::Mutex;
+use std::{collections::{HashMap, HashSet}, sync::{atomic::Ordering, Mutex}};
 
 const LEGACY_PROGRAM: Pubkey = solana_sdk::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
 const LEGACY_POOL: Pubkey = solana_sdk::pubkey!("J4jiEPEu8c8nLdpkiMa7k1P8rL1HCJSNxCvzA5DsmYds");
 const MAINNET_PROGRAM: Pubkey = solana_sdk::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 const MAINNET_CBBTC_USDC_POOL: Pubkey =
     solana_sdk::pubkey!("A5vkCw1VXPNXq5VFbffPm6Bo4kVKAP1UUoRrEn3gyVey");
+const MAINNET_TSLAX_USDC_POOL: Pubkey =
+    solana_sdk::pubkey!("6FQQyf7UcyU86TZC1cmAcfC4a18SJyDggEKtQfTJWmfs");
 const MAINNET_USDC_MINT: Pubkey =
     solana_sdk::pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 const MAINNET_CBBTC_MINT: Pubkey =
     solana_sdk::pubkey!("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij");
+const MAINNET_TSLAX_MINT: Pubkey =
+    solana_sdk::pubkey!("XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB");
 #[cfg(feature = "dynamic-pool")]
 const DYNAMIC_JUP_USDC_POOL: Pubkey =
     solana_sdk::pubkey!("DCiq2T2tMxdRgoQ2jQ9JhCNaMU5TxsPdrCa7esSCvxiw");
 #[cfg(feature = "dynamic-pool")]
 const JUP_MINT: Pubkey =
     solana_sdk::pubkey!("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN");
-#[cfg(feature = "dynamic-pool")]
 static LIVE_RPC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct LoadedPool {
@@ -79,6 +80,9 @@ fn decode_upgradeable_programdata_offset_handles_immutable_program() {
 #[test]
 #[ignore]
 fn litesvm_vs_sdk_legacy_sol_test_pool_exact_in() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
         println!("Skipping legacy pool LiteSVM test: compile with --features \"devnet with-litesvm\"");
         return;
@@ -105,7 +109,7 @@ fn litesvm_vs_sdk_legacy_sol_test_pool_exact_in() {
         sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
     );
 
-    let sim_result = simulate_legacy_swap(
+    let sim_result = simulate_configured_swap(
         &rpc,
         &loaded,
         input_mint,
@@ -132,6 +136,9 @@ fn litesvm_vs_sdk_legacy_sol_test_pool_exact_in() {
 #[test]
 #[ignore]
 fn litesvm_vs_sdk_legacy_sol_test_pool_exact_out() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
         println!("Skipping legacy pool LiteSVM test: compile with --features \"devnet with-litesvm\"");
         return;
@@ -158,7 +165,7 @@ fn litesvm_vs_sdk_legacy_sol_test_pool_exact_out() {
         sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
     );
 
-    let sim_result = simulate_legacy_swap(
+    let sim_result = simulate_configured_swap(
         &rpc,
         &loaded,
         input_mint,
@@ -187,8 +194,15 @@ fn litesvm_vs_sdk_legacy_sol_test_pool_exact_out() {
 #[test]
 #[ignore]
 fn litesvm_vs_sdk_mainnet_cbbtc_usdc_exact_in() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if BYREAL_CLMM_PROGRAM != MAINNET_PROGRAM {
         println!("Skipping mainnet pool LiteSVM test: compile with --features \"mainnet with-litesvm\"");
+        return;
+    }
+    if cfg!(feature = "dynamic-pool") {
+        println!("Skipping current mainnet pool swap_v3_dyn test: mainnet program is not upgraded yet");
         return;
     }
 
@@ -211,7 +225,7 @@ fn litesvm_vs_sdk_mainnet_cbbtc_usdc_exact_in() {
         sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
     );
 
-    let sim_result = simulate_legacy_swap(
+    let sim_result = simulate_configured_swap(
         &rpc,
         &loaded,
         cb_btc_mint,
@@ -238,8 +252,15 @@ fn litesvm_vs_sdk_mainnet_cbbtc_usdc_exact_in() {
 #[test]
 #[ignore]
 fn litesvm_vs_sdk_mainnet_cbbtc_usdc_exact_out() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if BYREAL_CLMM_PROGRAM != MAINNET_PROGRAM {
         println!("Skipping mainnet pool LiteSVM test: compile with --features \"mainnet with-litesvm\"");
+        return;
+    }
+    if cfg!(feature = "dynamic-pool") {
+        println!("Skipping current mainnet pool swap_v3_dyn test: mainnet program is not upgraded yet");
         return;
     }
 
@@ -262,7 +283,7 @@ fn litesvm_vs_sdk_mainnet_cbbtc_usdc_exact_out() {
         sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
     );
 
-    let sim_result = simulate_legacy_swap(
+    let sim_result = simulate_configured_swap(
         &rpc,
         &loaded,
         cb_btc_mint,
@@ -288,11 +309,133 @@ fn litesvm_vs_sdk_mainnet_cbbtc_usdc_exact_out() {
     assert_eq!(sim_result.destination_amount, desired_out);
 }
 
+#[test]
+#[ignore]
+fn litesvm_vs_sdk_mainnet_tslax_usdc_exact_in() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if BYREAL_CLMM_PROGRAM != MAINNET_PROGRAM {
+        println!("Skipping mainnet TSLAx pool LiteSVM test: compile with --features \"mainnet with-litesvm\"");
+        return;
+    }
+    if cfg!(feature = "dynamic-pool") {
+        println!("Skipping current mainnet TSLAx swap_v3_dyn test: mainnet program is not upgraded yet");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, MAINNET_TSLAX_USDC_POOL, MAINNET_PROGRAM).unwrap();
+    assert_mainnet_pair(&loaded, MAINNET_TSLAX_MINT, MAINNET_USDC_MINT, "TSLAx-USDC");
+    assert!(!loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+    let amount_in = 1_000_000u64;
+
+    let sdk_quote = loaded
+        .adapter
+        .quote(&QuoteParams {
+            amount: amount_in,
+            input_mint: MAINNET_TSLAX_MINT,
+            output_mint: MAINNET_USDC_MINT,
+            swap_mode: SwapMode::ExactIn,
+        })
+        .unwrap();
+    println!(
+        "Mainnet TSLAx SDK quote: in={}, out={}, fee={}",
+        sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+    );
+
+    let sim_result = simulate_configured_swap(
+        &rpc,
+        &loaded,
+        MAINNET_TSLAX_MINT,
+        MAINNET_USDC_MINT,
+        amount_in,
+        0,
+        true,
+        amount_in.saturating_mul(2),
+    )
+    .unwrap();
+    println!(
+        "Mainnet TSLAx LiteSVM out={}, diff (sdk_math - litesvm)={}",
+        sim_result.destination_amount,
+        sdk_quote.out_amount.saturating_sub(sim_result.destination_amount)
+    );
+
+    assert_amounts_close(
+        "mainnet TSLAx exact-in output amount",
+        sdk_quote.out_amount,
+        sim_result.destination_amount,
+    );
+}
+
+#[test]
+#[ignore]
+fn litesvm_vs_sdk_mainnet_tslax_usdc_exact_out() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if BYREAL_CLMM_PROGRAM != MAINNET_PROGRAM {
+        println!("Skipping mainnet TSLAx pool LiteSVM test: compile with --features \"mainnet with-litesvm\"");
+        return;
+    }
+    if cfg!(feature = "dynamic-pool") {
+        println!("Skipping current mainnet TSLAx swap_v3_dyn test: mainnet program is not upgraded yet");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, MAINNET_TSLAX_USDC_POOL, MAINNET_PROGRAM).unwrap();
+    assert_mainnet_pair(&loaded, MAINNET_TSLAX_MINT, MAINNET_USDC_MINT, "TSLAx-USDC");
+    assert!(!loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+    let desired_out = 1_000_000u64;
+
+    let sdk_quote = loaded
+        .adapter
+        .quote(&QuoteParams {
+            amount: desired_out,
+            input_mint: MAINNET_TSLAX_MINT,
+            output_mint: MAINNET_USDC_MINT,
+            swap_mode: SwapMode::ExactOut,
+        })
+        .unwrap();
+    println!(
+        "Mainnet TSLAx SDK exact-out quote: in={}, out={}, fee={}",
+        sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+    );
+
+    let sim_result = simulate_configured_swap(
+        &rpc,
+        &loaded,
+        MAINNET_TSLAX_MINT,
+        MAINNET_USDC_MINT,
+        desired_out,
+        sdk_quote.in_amount,
+        false,
+        sdk_quote.in_amount.saturating_mul(2),
+    )
+    .unwrap();
+    println!(
+        "Mainnet TSLAx LiteSVM exact-out in={}, out={}, diff (sdk_in - litesvm_in)={}",
+        sim_result.source_debit,
+        sim_result.destination_amount,
+        sdk_quote.in_amount.saturating_sub(sim_result.source_debit)
+    );
+
+    assert_amounts_close(
+        "mainnet TSLAx exact-out input amount",
+        sdk_quote.in_amount,
+        sim_result.source_debit,
+    );
+    assert_eq!(sim_result.destination_amount, desired_out);
+}
+
 #[cfg(feature = "dynamic-pool")]
 #[test]
 #[ignore]
 fn litesvm_vs_sdk_dynamic_jup_usdc_exact_in() {
-    let _guard = LIVE_RPC_TEST_LOCK.lock().unwrap();
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
         println!("Skipping dynamic pool LiteSVM test: compile with --features \"devnet dynamic-pool with-litesvm\"");
         return;
@@ -345,7 +488,9 @@ fn litesvm_vs_sdk_dynamic_jup_usdc_exact_in() {
 #[test]
 #[ignore]
 fn litesvm_vs_sdk_dynamic_jup_usdc_exact_out() {
-    let _guard = LIVE_RPC_TEST_LOCK.lock().unwrap();
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
         println!("Skipping dynamic pool LiteSVM test: compile with --features \"devnet dynamic-pool with-litesvm\"");
         return;
@@ -400,7 +545,9 @@ fn litesvm_vs_sdk_dynamic_jup_usdc_exact_out() {
 #[test]
 #[ignore]
 fn litesvm_vs_sdk_dynamic_jup_usdc_reverse_exact_in() {
-    let _guard = LIVE_RPC_TEST_LOCK.lock().unwrap();
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
         println!("Skipping dynamic pool LiteSVM test: compile with --features \"devnet dynamic-pool with-litesvm\"");
         return;
@@ -453,7 +600,9 @@ fn litesvm_vs_sdk_dynamic_jup_usdc_reverse_exact_in() {
 #[test]
 #[ignore]
 fn litesvm_vs_sdk_dynamic_jup_usdc_reverse_exact_out() {
-    let _guard = LIVE_RPC_TEST_LOCK.lock().unwrap();
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if BYREAL_CLMM_PROGRAM != LEGACY_PROGRAM {
         println!("Skipping dynamic pool LiteSVM test: compile with --features \"devnet dynamic-pool with-litesvm\"");
         return;
@@ -649,12 +798,63 @@ fn cbbtc_mint_from_pool(loaded: &LoadedPool) -> Pubkey {
     cb_btc_mint
 }
 
+fn assert_mainnet_pair(loaded: &LoadedPool, mint_a: Pubkey, mint_b: Pubkey, label: &str) {
+    let pool_state = &loaded.common_amm.pool_state;
+    let has_pair = (pool_state.token_mint_0 == mint_a && pool_state.token_mint_1 == mint_b)
+        || (pool_state.token_mint_0 == mint_b && pool_state.token_mint_1 == mint_a);
+    assert!(
+        has_pair,
+        "Pool {} is not a {} pool (mints: {}, {})",
+        loaded.pool_address, label, pool_state.token_mint_0, pool_state.token_mint_1
+    );
+}
+
 struct SimResult {
     source_debit: u64,
     destination_amount: u64,
 }
 
-fn simulate_legacy_swap(
+fn simulate_configured_swap(
+    rpc: &RpcClient,
+    loaded: &LoadedPool,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+    amount: u64,
+    other_amount_threshold: u64,
+    is_base_input: bool,
+    source_balance: u64,
+) -> Result<SimResult> {
+    #[cfg(feature = "dynamic-pool")]
+    {
+        simulate_swap_v3_dyn(
+            rpc,
+            loaded,
+            input_mint,
+            output_mint,
+            amount,
+            other_amount_threshold,
+            is_base_input,
+            source_balance,
+        )
+    }
+
+    #[cfg(not(feature = "dynamic-pool"))]
+    {
+        simulate_swap_v2(
+            rpc,
+            loaded,
+            input_mint,
+            output_mint,
+            amount,
+            other_amount_threshold,
+            is_base_input,
+            source_balance,
+        )
+    }
+}
+
+#[cfg(not(feature = "dynamic-pool"))]
+fn simulate_swap_v2(
     rpc: &RpcClient,
     loaded: &LoadedPool,
     input_mint: Pubkey,
@@ -687,12 +887,13 @@ fn simulate_legacy_swap(
         (source_token_account, input_mint, source_balance),
         (destination_token_account, output_mint, 0),
     ] {
+        let token_program = token_program_for_mint(loaded, mint)?;
         svm.set_account(
             RawPubkey::new_from_array(address.to_bytes()),
             RawAccount {
                 lamports: 1_000_000_000,
                 data: spl_token_account_data(mint, user, token_amount),
-                owner: RawPubkey::new_from_array(anchor_spl::token::ID.to_bytes()),
+                owner: RawPubkey::new_from_array(token_program.to_bytes()),
                 executable: false,
                 rent_epoch: 0,
             },
@@ -706,31 +907,26 @@ fn simulate_legacy_swap(
     clock_sysvar.unix_timestamp = loaded.swap_timestamp;
     svm.set_sysvar(&clock_sysvar);
 
-    let zero_for_one = input_mint == loaded.common_amm.pool_state.token_mint_0;
-    let (input_vault, output_vault) = if zero_for_one {
-        (
-            loaded.common_amm.pool_state.token_vault_0,
-            loaded.common_amm.pool_state.token_vault_1,
-        )
-    } else {
-        (
-            loaded.common_amm.pool_state.token_vault_1,
-            loaded.common_amm.pool_state.token_vault_0,
-        )
-    };
+    let swap = loaded.adapter.get_swap_and_account_metas(&SwapParams {
+        source_mint: input_mint,
+        destination_mint: output_mint,
+        source_token_account,
+        destination_token_account,
+        token_transfer_authority: user,
+        quote_mint_to_referrer: None,
+        jupiter_program_id: &Pubkey::new_unique(),
+        in_amount: if is_base_input { amount } else { other_amount_threshold },
+        out_amount: if is_base_input { other_amount_threshold } else { amount },
+        missing_dynamic_accounts_as_default: false,
+        swap_mode: if is_base_input {
+            SwapMode::ExactIn
+        } else {
+            SwapMode::ExactOut
+        },
+    })?;
+    assert_eq!(swap.swap, Swap::RaydiumClmmV2);
 
-    let ordered_tick_arrays = loaded
-        .common_amm
-        .get_swap_tick_arrays(zero_for_one)
-        .into_iter()
-        .filter(|addr| loaded.account_map.contains_key(addr))
-        .collect::<Vec<_>>();
-    ensure!(
-        !ordered_tick_arrays.is_empty(),
-        "No tick array accounts available for legacy swap"
-    );
-
-    let mut data = vec![248u8, 198, 158, 145, 225, 117, 135, 200];
+    let mut data = swap_v2_discriminator().to_vec();
     data.extend(serialize_swap_ix_args(&SwapIxArgs {
         amount,
         other_amount_threshold,
@@ -738,36 +934,19 @@ fn simulate_legacy_swap(
         is_base_input,
     }));
 
-    let mut accounts = vec![
-        raw_meta(user, true, false),
-        raw_meta(loaded.common_amm.pool_state.amm_config, false, false),
-        raw_meta(loaded.pool_address, false, true),
-        raw_meta(source_token_account, false, true),
-        raw_meta(destination_token_account, false, true),
-        raw_meta(input_vault, false, true),
-        raw_meta(output_vault, false, true),
-        raw_meta(loaded.common_amm.pool_state.observation_key, false, true),
-        raw_meta(anchor_spl::token::ID, false, false),
-        raw_meta(ordered_tick_arrays[0], false, true),
-    ];
-
-    let bitmap_key = TickArrayBitmapExtension::key(loaded.pool_address);
-    if loaded.account_map.contains_key(&bitmap_key) {
-        accounts.push(raw_meta(bitmap_key, false, false));
-    }
-    for addr in ordered_tick_arrays.iter().skip(1) {
-        accounts.push(raw_meta(*addr, false, true));
-    }
-
     let raw_ix = RawInstruction {
         program_id: clmm_program,
-        accounts,
+        accounts: swap
+            .account_metas
+            .iter()
+            .map(raw_meta_from_sdk)
+            .collect::<Vec<_>>(),
         data,
     };
     let tx = RawTransaction::new_unsigned(RawMessage::new(&[raw_ix], Some(&user_raw)));
     let sim = svm
         .simulate_transaction(tx)
-        .map_err(|e| anyhow!("legacy LiteSVM simulate_transaction failed: {e:?}"))?;
+        .map_err(|e| anyhow!("swap_v2 LiteSVM simulate_transaction failed: {e:?}"))?;
 
     let source_post = post_token_amount(&sim.post_accounts, source_token_account)?;
     let destination_post = post_token_amount(&sim.post_accounts, destination_token_account)?;
@@ -818,12 +997,13 @@ fn simulate_swap_v3_dyn(
         (source_token_account, input_mint, source_balance),
         (destination_token_account, output_mint, 0),
     ] {
+        let token_program = token_program_for_mint(loaded, mint)?;
         svm.set_account(
             RawPubkey::new_from_array(address.to_bytes()),
             RawAccount {
                 lamports: 1_000_000_000,
                 data: spl_token_account_data(mint, user, token_amount),
-                owner: RawPubkey::new_from_array(anchor_spl::token::ID.to_bytes()),
+                owner: RawPubkey::new_from_array(token_program.to_bytes()),
                 executable: false,
                 rent_epoch: 0,
             },
@@ -905,15 +1085,6 @@ fn serialize_swap_ix_args(args: &SwapIxArgs) -> Vec<u8> {
     data
 }
 
-fn raw_meta(pubkey: Pubkey, is_signer: bool, is_writable: bool) -> RawAccountMeta {
-    RawAccountMeta {
-        pubkey: RawPubkey::new_from_array(pubkey.to_bytes()),
-        is_signer,
-        is_writable,
-    }
-}
-
-#[cfg(feature = "dynamic-pool")]
 fn raw_meta_from_sdk(meta: &solana_sdk::instruction::AccountMeta) -> RawAccountMeta {
     RawAccountMeta {
         pubkey: RawPubkey::new_from_array(meta.pubkey.to_bytes()),
@@ -922,10 +1093,24 @@ fn raw_meta_from_sdk(meta: &solana_sdk::instruction::AccountMeta) -> RawAccountM
     }
 }
 
+#[cfg(not(feature = "dynamic-pool"))]
+fn swap_v2_discriminator() -> [u8; 8] {
+    let hash = solana_program::hash::hash(b"global:swap_v2").to_bytes();
+    hash[..8].try_into().unwrap()
+}
+
 #[cfg(feature = "dynamic-pool")]
 fn swap_v3_dyn_discriminator() -> [u8; 8] {
     let hash = solana_program::hash::hash(b"global:swap_v3_dyn").to_bytes();
     hash[..8].try_into().unwrap()
+}
+
+fn token_program_for_mint(loaded: &LoadedPool, mint: Pubkey) -> Result<Pubkey> {
+    loaded
+        .account_map
+        .get(&mint)
+        .map(|account| account.owner)
+        .ok_or_else(|| anyhow!("mint account {mint} not loaded"))
 }
 
 fn post_token_amount(
