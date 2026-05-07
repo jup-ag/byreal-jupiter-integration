@@ -1012,6 +1012,15 @@ mod tests {
     fn test_dynamic_fee_rejects_stale_pyth_prices() {
         let mut amm = build_neutral_dynamic_amm(true);
         let current_timestamp = 100 + DYNAMIC_MAX_PYTH_AGE_SECONDS + 1;
+        amm.token0_pyth_price.as_mut().unwrap().publish_time = 100;
+        amm.token1_pyth_price.as_mut().unwrap().publish_time = current_timestamp;
+
+        let err = amm
+            .compute_trade_fee_rate(true, 1_000_000, true, current_timestamp)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("stale"));
+
+        let mut amm = build_neutral_dynamic_amm(true);
         amm.token0_pyth_price.as_mut().unwrap().publish_time = current_timestamp;
         amm.token1_pyth_price.as_mut().unwrap().publish_time = 100;
 
@@ -1026,6 +1035,45 @@ mod tests {
         let mut amm = build_neutral_dynamic_amm(true);
         amm.token0_pyth_price = Some(Price {
             price: 0,
+            conf: 1,
+            exponent: -6,
+            publish_time: 100,
+        });
+
+        let err = amm
+            .compute_trade_fee_rate(true, 1_000_000, true, 200)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-positive"));
+
+        let mut amm = build_neutral_dynamic_amm(true);
+        amm.token0_pyth_price = Some(Price {
+            price: -1,
+            conf: 1,
+            exponent: -6,
+            publish_time: 100,
+        });
+
+        let err = amm
+            .compute_trade_fee_rate(true, 1_000_000, true, 200)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-positive"));
+
+        let mut amm = build_neutral_dynamic_amm(true);
+        amm.token1_pyth_price = Some(Price {
+            price: 0,
+            conf: 1,
+            exponent: -6,
+            publish_time: 100,
+        });
+
+        let err = amm
+            .compute_trade_fee_rate(true, 1_000_000, true, 200)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-positive"));
+
+        let mut amm = build_neutral_dynamic_amm(true);
+        amm.token1_pyth_price = Some(Price {
+            price: -1,
             conf: 1,
             exponent: -6,
             publish_time: 100,

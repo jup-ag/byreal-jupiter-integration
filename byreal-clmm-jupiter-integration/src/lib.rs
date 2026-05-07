@@ -721,6 +721,27 @@ mod tests {
 
     #[cfg(feature = "dynamic-pool")]
     #[test]
+    fn test_dynamic_pool_update_loads_valid_pyth_prices_and_vault_amounts() {
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token0_pyth_feed_id,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        amm.update(&account_map).unwrap();
+
+        assert_eq!(amm.amm.token0_vault_amount, 1_000);
+        assert_eq!(amm.amm.token1_vault_amount, 1_000);
+        assert_eq!(amm.amm.token0_pyth_price.unwrap().price, 1_000_000);
+        assert_eq!(amm.amm.token1_pyth_price.unwrap().price, 1_000_000);
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
     fn test_dynamic_pool_update_rejects_zero_feed_ids() {
         let mut amm = build_dynamic_test_amm();
         amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
@@ -778,6 +799,19 @@ mod tests {
             [9u8; 32],
             PYTH_RECEIVER_PROGRAM_ID,
             amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("pyth feed id mismatch"));
+
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token0_pyth_feed_id,
+            PYTH_RECEIVER_PROGRAM_ID,
+            [9u8; 32],
         );
 
         let err = amm.update(&account_map).unwrap_err();
