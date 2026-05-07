@@ -968,6 +968,33 @@ mod tests {
         }
     }
 
+    fn build_neutral_dynamic_amm(token1_as_quote: bool) -> ByrealClmmAmm {
+        let mut amm = build_dynamic_amm();
+        amm.pool_state.mint_decimals_0 = 6;
+        amm.pool_state.mint_decimals_1 = 6;
+        amm.pool_state.set_quote_token_flag(token1_as_quote);
+        amm.pool_state.arbitrage_fee_buffer_ppm = 0;
+        amm.pool_state.trade_slippage_fee_base = 0;
+        amm.pool_state.trade_slippage_fee_trade_size_threshold = 1;
+        amm.pool_state.imbalance_fee_base = 0;
+        amm.pool_state.imbalance_fee_x = 10;
+        amm.amm_config.trade_fee_rate = 0;
+        amm.pool_state.trade_fee_rate = 0;
+        amm.token0_pyth_price = Some(Price {
+            price: 1_000_000,
+            conf: 1,
+            exponent: -6,
+            publish_time: 100,
+        });
+        amm.token1_pyth_price = Some(Price {
+            price: 1_000_000,
+            conf: 1,
+            exponent: -6,
+            publish_time: 100,
+        });
+        amm
+    }
+
     fn transfer_fee_config(basis_points: u16, maximum_fee: u64) -> TransferFeeConfig {
         let transfer_fee = TransferFee {
             epoch: 0.into(),
@@ -983,17 +1010,126 @@ mod tests {
 
     #[test]
     fn test_dynamic_fee_rejects_stale_pyth_prices() {
-        let amm = build_dynamic_amm();
+        let mut amm = build_neutral_dynamic_amm(true);
+        let current_timestamp = 100 + DYNAMIC_MAX_PYTH_AGE_SECONDS + 1;
+        amm.token0_pyth_price.as_mut().unwrap().publish_time = current_timestamp;
+        amm.token1_pyth_price.as_mut().unwrap().publish_time = 100;
 
         let err = amm
-            .compute_trade_fee_rate(
-                true,
-                1_000_000,
-                true,
-                100 + DYNAMIC_MAX_PYTH_AGE_SECONDS + 1,
-            )
+            .compute_trade_fee_rate(true, 1_000_000, true, current_timestamp)
             .unwrap_err();
         assert!(format!("{err:#}").contains("stale"));
+    }
+
+    #[test]
+    fn test_dynamic_fee_rejects_non_positive_pyth_prices() {
+        let mut amm = build_neutral_dynamic_amm(true);
+        amm.token0_pyth_price = Some(Price {
+            price: 0,
+            conf: 1,
+            exponent: -6,
+            publish_time: 100,
+        });
+
+        let err = amm
+            .compute_trade_fee_rate(true, 1_000_000, true, 200)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-positive"));
+    }
+
+    #[test]
+    fn test_dynamic_fee_accepts_pyth_price_at_staleness_boundary() {
+        let mut amm = build_neutral_dynamic_amm(true);
+        amm.token0_pyth_price.as_mut().unwrap().publish_time = 100;
+        amm.token1_pyth_price.as_mut().unwrap().publish_time = 100;
+
+        let got = amm
+            .compute_trade_fee_rate(true, 1_000_000, true, 100 + DYNAMIC_MAX_PYTH_AGE_SECONDS)
+            .unwrap();
+        assert_eq!(got, 0);
+    }
+
+    #[test]
+    fn test_dynamic_fee_direction_mapping_when_token1_is_quote() {
+        let mut amm = build_neutral_dynamic_amm(true);
+        amm.pool_state.imbalance_fee_base = 5;
+        amm.pool_state.imbalance_fee_x = 10;
+        amm.token0_vault_amount = 150;
+        amm.token1_vault_amount = 50;
+
+        let selling_overweight_base = amm
+            .compute_trade_fee_rate(true, 1, true, 200)
+            .unwrap();
+        let buying_overweight_base = amm
+            .compute_trade_fee_rate(false, 1, true, 200)
+            .unwrap();
+
+        assert_eq!(selling_overweight_base, 200_000);
+        assert_eq!(buying_overweight_base, 0);
+    }
+
+    #[test]
+    fn test_dynamic_fee_direction_mapping_when_token0_is_quote() {
+        let mut amm = build_neutral_dynamic_amm(false);
+        amm.pool_state.imbalance_fee_base = 5;
+        amm.pool_state.imbalance_fee_x = 10;
+        amm.token0_vault_amount = 50;
+        amm.token1_vault_amount = 150;
+
+        let buying_overweight_base = amm
+            .compute_trade_fee_rate(true, 1, true, 200)
+            .unwrap();
+        let selling_overweight_base = amm
+            .compute_trade_fee_rate(false, 1, true, 200)
+            .unwrap();
+
+        assert_eq!(buying_overweight_base, 0);
+        assert_eq!(selling_overweight_base, 200_000);
+    }
+
+    #[test]
+    fn test_dynamic_fee_trade_size_mapping_uses_normalized_quote_amount() {
+        let mut amm = build_neutral_dynamic_amm(true);
+        amm.pool_state.trade_slippage_fee_base = 15;
+        amm.pool_state.trade_slippage_fee_trade_size_threshold = 50;
+
+        let just_above_threshold = amm
+            .compute_trade_fee_rate(false, 5_001_000_000, true, 200)
+            .unwrap();
+        let below_one_quote_token = amm
+            .compute_trade_fee_rate(false, 500_999, true, 200)
+            .unwrap();
+
+        assert_eq!(just_above_threshold, 15_000);
+        assert_eq!(below_one_quote_token, 0);
+    }
+
+    #[test]
+    fn test_dynamic_fee_base_vault_value_mapping_uses_quote_token_side() {
+        let mut token1_quote = build_neutral_dynamic_amm(true);
+        token1_quote.pool_state.imbalance_fee_base = 5;
+        token1_quote.pool_state.imbalance_fee_x = 10;
+        token1_quote.token0_vault_amount = 150;
+        token1_quote.token1_vault_amount = 50;
+
+        let mut token0_quote = build_neutral_dynamic_amm(false);
+        token0_quote.pool_state.imbalance_fee_base = 5;
+        token0_quote.pool_state.imbalance_fee_x = 10;
+        token0_quote.token0_vault_amount = 50;
+        token0_quote.token1_vault_amount = 150;
+
+        assert_eq!(
+            token1_quote
+                .compute_trade_fee_rate(true, 1, true, 200)
+                .unwrap(),
+            200_000
+        );
+        assert_eq!(
+            token0_quote
+                .compute_trade_fee_rate(false, 1, true, 200)
+                .unwrap(),
+            200_000
+        );
     }
 
     #[test]

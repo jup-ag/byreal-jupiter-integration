@@ -473,6 +473,155 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "dynamic-pool")]
+    fn pool_state_account_data(pool_state: &PoolState) -> Vec<u8> {
+        let mut data = Vec::with_capacity(PoolState::LEN);
+        data.extend_from_slice(&PoolState::DISCRIMINATOR);
+        data.extend_from_slice(bytemuck::bytes_of(pool_state));
+        data
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn amm_config_account_data(config: &AmmConfig) -> Vec<u8> {
+        let mut data = Vec::new();
+        anchor_lang::AccountSerialize::try_serialize(config, &mut data).unwrap();
+        data
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn spl_vault_account_data(amount: u64) -> Vec<u8> {
+        let mut vault = spl_token::state::Account::default();
+        vault.state = spl_token::state::AccountState::Initialized;
+        vault.amount = amount;
+        let mut data = vec![0u8; spl_token::state::Account::LEN];
+        spl_token::state::Account::pack(vault, &mut data).unwrap();
+        data
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn pyth_price_account_data(feed_id: [u8; 32]) -> Vec<u8> {
+        let account = PriceUpdateV2 {
+            write_authority: Pubkey::new_unique(),
+            verification_level: pyth_solana_receiver_sdk::price_update::VerificationLevel::Full,
+            price_message: pyth_solana_receiver_sdk::price_update::PriceFeedMessage {
+                feed_id,
+                price: 1_000_000,
+                conf: 1,
+                exponent: -6,
+                publish_time: 100,
+                prev_publish_time: 99,
+                ema_price: 1_000_000,
+                ema_conf: 1,
+            },
+            posted_slot: 1,
+        };
+        let mut data = Vec::new();
+        anchor_lang::AccountSerialize::try_serialize(&account, &mut data).unwrap();
+        data
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn base_update_account_map(pool_key: Pubkey, pool_state: &PoolState) -> AccountMap {
+        let mut account_map = AccountMap::default();
+        account_map.insert(
+            pool_key,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: pool_state_account_data(pool_state),
+                owner: BYREAL_CLMM_PROGRAM,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            pool_state.amm_config,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: amm_config_account_data(&AmmConfig::default()),
+                owner: BYREAL_CLMM_PROGRAM,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            pool_state.token_mint_0,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: Vec::new(),
+                owner: spl_token::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            pool_state.token_mint_1,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: Vec::new(),
+                owner: spl_token::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn dynamic_update_account_map(
+        pool_key: Pubkey,
+        pool_state: &PoolState,
+        pyth0_owner: Pubkey,
+        pyth0_feed_id: [u8; 32],
+        pyth1_owner: Pubkey,
+        pyth1_feed_id: [u8; 32],
+    ) -> AccountMap {
+        let mut account_map = base_update_account_map(pool_key, pool_state);
+        account_map.insert(
+            pool_state.token_vault_0,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: spl_vault_account_data(1_000),
+                owner: spl_token::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            pool_state.token_vault_1,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: spl_vault_account_data(1_000),
+                owner: spl_token::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+
+        let (token0_pyth_oracle, token1_pyth_oracle) =
+            get_dynamic_pyth_oracle_addresses(pool_state).unwrap();
+        account_map.insert(
+            token0_pyth_oracle,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: pyth_price_account_data(pyth0_feed_id),
+                owner: pyth0_owner,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            token1_pyth_oracle,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: pyth_price_account_data(pyth1_feed_id),
+                owner: pyth1_owner,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map
+    }
+
     #[cfg(not(feature = "dynamic-pool"))]
     #[test]
     fn test_dynamic_pool_disabled_rejects_quote_and_swap_metas() {
@@ -539,6 +688,100 @@ mod tests {
 
         let err = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap_err();
         assert!(format!("{err:#}").contains("dynamic pool token0 pyth feed id is zero"));
+    }
+
+    #[test]
+    fn test_dynamic_pyth_oracle_addresses_reject_token1_zero_feed_id() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token1_pyth_feed_id = [0u8; 32];
+
+        let err = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap_err();
+        assert!(format!("{err:#}").contains("dynamic pool token1 pyth feed id is zero"));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_accounts_to_update_omit_invalid_zero_feed_pyth_accounts() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
+
+        let accounts = amm.get_accounts_to_update();
+
+        assert!(accounts.contains(&amm.amm.pool_state.token_vault_0));
+        assert!(accounts.contains(&amm.amm.pool_state.token_vault_1));
+        assert!(!accounts.contains(&get_price_feed_account_address(
+            PYTH_PRICE_SHARD_ID,
+            &[0u8; 32]
+        )));
+        assert!(!accounts.contains(&get_price_feed_account_address(
+            PYTH_PRICE_SHARD_ID,
+            &amm.amm.pool_state.token1_pyth_feed_id
+        )));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_update_rejects_zero_feed_ids() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
+        let account_map = base_update_account_map(amm.key, &amm.amm.pool_state);
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("dynamic pool token0 pyth feed id is zero"));
+
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token1_pyth_feed_id = [0u8; 32];
+        let account_map = base_update_account_map(amm.key, &amm.amm.pool_state);
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("dynamic pool token1 pyth feed id is zero"));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_update_rejects_pyth_owner_mismatch() {
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            Pubkey::new_unique(),
+            amm.amm.pool_state.token0_pyth_feed_id,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("token0 pyth oracle owner mismatch"));
+
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token0_pyth_feed_id,
+            Pubkey::new_unique(),
+            amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("token1 pyth oracle owner mismatch"));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_update_rejects_pyth_feed_id_mismatch() {
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            PYTH_RECEIVER_PROGRAM_ID,
+            [9u8; 32],
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("pyth feed id mismatch"));
     }
 
     #[test]
