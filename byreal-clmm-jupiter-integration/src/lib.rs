@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use anyhow::{anyhow, ensure, Result};
+use pyth_solana_receiver_sdk::price_update::{Price, PriceUpdateV2};
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use std::{
     collections::{HashMap, HashSet},
@@ -7,8 +8,14 @@ use std::{
 };
 
 use jupiter_amm_interface::{
-    single_program_amm, try_get_account_data, AccountMap, Amm, AmmContext, KeyedAccount, Quote,
-    QuoteParams, SingleProgramAmm, Swap, SwapAndAccountMetas, SwapMode, SwapParams,
+    single_program_amm, try_get_account_data, try_get_account_data_and_owner, AccountMap, Amm,
+    AmmContext, KeyedAccount, Quote, QuoteParams, SingleProgramAmm, Swap, SwapAndAccountMetas,
+    SwapMode, SwapParams,
+};
+use spl_token::solana_program::program_pack::Pack;
+use spl_token_2022::{
+    extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    state::{Account as Token2022Account, Mint as Token2022Mint},
 };
 
 use byreal_clmm_common::{
@@ -29,14 +36,181 @@ pub const BYREAL_CLMM_PROGRAM: Pubkey =
     solana_sdk::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 pub const ID: Pubkey = BYREAL_CLMM_PROGRAM;
+const PYTH_RECEIVER_PROGRAM_ID: Pubkey = pyth_solana_receiver_sdk::ID;
+const PYTH_PRICE_SHARD_ID: u16 = 0;
 
 single_program_amm!(ByrealClmm, ID, "Byreal");
+
+fn dynamic_enabled() -> bool {
+    cfg!(feature = "dynamic-pool")
+}
+
+fn get_price_feed_account_address(shard_id: u16, feed_id: &[u8; 32]) -> Pubkey {
+    let shard_bytes = shard_id.to_le_bytes();
+    Pubkey::find_program_address(
+        &[&shard_bytes, feed_id],
+        &pyth_solana_receiver_sdk::PYTH_PUSH_ORACLE_ID,
+    )
+    .0
+}
+
+fn get_dynamic_pyth_oracle_addresses(pool_state: &PoolState) -> Result<(Pubkey, Pubkey)> {
+    ensure!(
+        pool_state.token0_pyth_feed_id != [0u8; 32],
+        "dynamic pool token0 pyth feed id is zero"
+    );
+    ensure!(
+        pool_state.token1_pyth_feed_id != [0u8; 32],
+        "dynamic pool token1 pyth feed id is zero"
+    );
+
+    Ok((
+        get_price_feed_account_address(PYTH_PRICE_SHARD_ID, &pool_state.token0_pyth_feed_id),
+        get_price_feed_account_address(PYTH_PRICE_SHARD_ID, &pool_state.token1_pyth_feed_id),
+    ))
+}
+
+fn decode_vault_amount(owner: &Pubkey, data: &[u8]) -> Result<u64> {
+    if *owner == spl_token::id() {
+        let account = spl_token::state::Account::unpack(data)
+            .map_err(|e| anyhow!("decode SPL token vault failed: {e}"))?;
+        return Ok(account.amount);
+    }
+    if *owner == spl_token_2022::id() {
+        let account = StateWithExtensions::<Token2022Account>::unpack(data)
+            .map_err(|e| anyhow!("decode SPL token-2022 vault failed: {e}"))?;
+        return Ok(account.base.amount);
+    }
+    Err(anyhow!("unsupported token vault owner: {owner}"))
+}
+
+fn decode_pyth_price(data: &[u8], expected_feed_id: &[u8; 32]) -> Result<Price> {
+    let mut data_ref = data;
+    let account = PriceUpdateV2::try_deserialize(&mut data_ref)
+        .map_err(|e| anyhow!("decode pyth account failed: {e}"))?;
+    account
+        .get_price_unchecked(expected_feed_id)
+        .map_err(|e| anyhow!("pyth feed id mismatch: {e}"))
+}
+
+fn decode_transfer_fee_config(owner: &Pubkey, data: &[u8]) -> Result<Option<TransferFeeConfig>> {
+    if *owner == spl_token::id() {
+        return Ok(None);
+    }
+    if *owner == spl_token_2022::id() {
+        let mint = StateWithExtensions::<Token2022Mint>::unpack(data)
+            .map_err(|e| anyhow!("decode token-2022 mint failed: {e}"))?;
+        return Ok(mint.get_extension::<TransferFeeConfig>().ok().copied());
+    }
+    Err(anyhow!("unsupported token mint owner: {owner}"))
+}
 
 #[derive(Clone)]
 pub struct ByrealClmm {
     key: Pubkey,
     amm: ByrealClmmAmm,
     timestamp: Arc<AtomicI64>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ByrealClmm {
+    fn swap_direction_for_mints(&self, source_mint: Pubkey, destination_mint: Pubkey) -> Result<bool> {
+        match (
+            source_mint == self.amm.pool_state.token_mint_0,
+            source_mint == self.amm.pool_state.token_mint_1,
+            destination_mint == self.amm.pool_state.token_mint_0,
+            destination_mint == self.amm.pool_state.token_mint_1,
+        ) {
+            (true, false, false, true) => Ok(true),
+            (false, true, true, false) => Ok(false),
+            _ => Err(anyhow!("swap mints do not match pool reserves")),
+        }
+    }
+
+    fn live_directional_tick_arrays(&self, zero_for_one: bool) -> Result<Vec<Pubkey>> {
+        let candidate_tick_arrays = self.amm.get_swap_tick_arrays(zero_for_one);
+        let mut live_tick_arrays = Vec::new();
+
+        for address in candidate_tick_arrays {
+            if self.amm.dynamic_tick_arrays.contains_key(&address) {
+                live_tick_arrays.push(address);
+            } else if live_tick_arrays.is_empty() {
+                return Err(anyhow!(
+                    "directional first tick array account missing for dynamic swap: {address}"
+                ));
+            }
+        }
+
+        ensure!(
+            !live_tick_arrays.is_empty(),
+            "No directional tick array accounts available for dynamic swap"
+        );
+        Ok(live_tick_arrays)
+    }
+
+    pub fn build_swap_v3_dyn_account_metas(
+        &self,
+        swap_params: &SwapParams,
+    ) -> Result<Vec<AccountMeta>> {
+        let mut account_metas = self.build_swap_v2_account_metas(swap_params)?;
+
+        if self.amm.pool_state.is_swap_dynamic_fee_enabled() {
+            let (token0_pyth_oracle, token1_pyth_oracle) =
+                get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)?;
+            account_metas.push(AccountMeta::new_readonly(token0_pyth_oracle, false));
+            account_metas.push(AccountMeta::new_readonly(token1_pyth_oracle, false));
+        }
+
+        Ok(account_metas)
+    }
+
+    fn build_swap_v2_account_metas(&self, swap_params: &SwapParams) -> Result<Vec<AccountMeta>> {
+        let zero_for_one =
+            self.swap_direction_for_mints(swap_params.source_mint, swap_params.destination_mint)?;
+        let live_tick_arrays = self.live_directional_tick_arrays(zero_for_one)?;
+
+        let mut account_metas = vec![
+            AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
+            AccountMeta::new_readonly(self.amm.pool_state.amm_config, false),
+            AccountMeta::new(self.key, false),
+            AccountMeta::new(swap_params.source_token_account, false),
+            AccountMeta::new(swap_params.destination_token_account, false),
+            if zero_for_one {
+                AccountMeta::new(self.amm.pool_state.token_vault_0, false)
+            } else {
+                AccountMeta::new(self.amm.pool_state.token_vault_1, false)
+            },
+            if zero_for_one {
+                AccountMeta::new(self.amm.pool_state.token_vault_1, false)
+            } else {
+                AccountMeta::new(self.amm.pool_state.token_vault_0, false)
+            },
+            AccountMeta::new(self.amm.pool_state.observation_key, false),
+            AccountMeta::new_readonly(anchor_spl::token::ID, false),
+            AccountMeta::new_readonly(spl_token_2022::ID, false),
+            AccountMeta::new_readonly(anchor_spl::memo::ID, false),
+            if zero_for_one {
+                AccountMeta::new_readonly(self.amm.pool_state.token_mint_0, false)
+            } else {
+                AccountMeta::new_readonly(self.amm.pool_state.token_mint_1, false)
+            },
+            if zero_for_one {
+                AccountMeta::new_readonly(self.amm.pool_state.token_mint_1, false)
+            } else {
+                AccountMeta::new_readonly(self.amm.pool_state.token_mint_0, false)
+            },
+        ];
+
+        account_metas.push(AccountMeta::new_readonly(
+            TickArrayBitmapExtension::key(self.key),
+            false,
+        ));
+        for address in live_tick_arrays {
+            account_metas.push(AccountMeta::new(address, false));
+        }
+
+        Ok(account_metas)
+    }
 }
 
 impl Amm for ByrealClmm {
@@ -52,8 +226,15 @@ impl Amm for ByrealClmm {
                 bitmap_extension: Some(TickArrayBitmapExtension::default()),
                 max_one_side_tick_arrays: 3, // 3 extra tick arrays
                 dynamic_tick_arrays: HashMap::new(),
+                token0_vault_amount: 0,
+                token1_vault_amount: 0,
+                token0_pyth_price: None,
+                token1_pyth_price: None,
+                token0_transfer_fee_config: None,
+                token1_transfer_fee_config: None,
             },
             timestamp: amm_context.clock_ref.unix_timestamp.clone(),
+            epoch: amm_context.clock_ref.epoch.clone(),
         })
     }
 
@@ -80,12 +261,25 @@ impl Amm for ByrealClmm {
         let mut accounts = vec![
             self.key, // Pool state itself
             self.amm.pool_state.amm_config,
+            self.amm.pool_state.token_mint_0,
+            self.amm.pool_state.token_mint_1,
         ];
 
         let bitmap_key = TickArrayBitmapExtension::key(self.key);
         accounts.push(bitmap_key);
 
         accounts.extend(self.amm.get_all_tick_array_addresses());
+
+        if dynamic_enabled() && self.amm.pool_state.is_swap_dynamic_fee_enabled() {
+            accounts.push(self.amm.pool_state.token_vault_0);
+            accounts.push(self.amm.pool_state.token_vault_1);
+            if let Ok((token0_pyth_oracle, token1_pyth_oracle)) =
+                get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)
+            {
+                accounts.push(token0_pyth_oracle);
+                accounts.push(token1_pyth_oracle);
+            }
+        }
         accounts
     }
 
@@ -100,11 +294,21 @@ impl Amm for ByrealClmm {
             &self.amm.pool_state.amm_config,
         )?)?;
 
+        let (mint0_data, mint0_owner) =
+            try_get_account_data_and_owner(account_map, &self.amm.pool_state.token_mint_0)?;
+        self.amm.token0_transfer_fee_config =
+            decode_transfer_fee_config(mint0_owner, mint0_data)?;
+        let (mint1_data, mint1_owner) =
+            try_get_account_data_and_owner(account_map, &self.amm.pool_state.token_mint_1)?;
+        self.amm.token1_transfer_fee_config =
+            decode_transfer_fee_config(mint1_owner, mint1_data)?;
+
         // Update bitmap extension
         let bitmap_key = TickArrayBitmapExtension::key(self.key);
-        self.amm.bitmap_extension = Some(TickArrayBitmapExtension::try_deserialize(
-            &mut try_get_account_data(account_map, &bitmap_key)?,
-        )?);
+        self.amm.bitmap_extension = match try_get_account_data(account_map, &bitmap_key) {
+            Ok(mut data) => Some(TickArrayBitmapExtension::try_deserialize(&mut data)?),
+            Err(_) => None,
+        };
 
         // Update tick arrays
         self.amm.dynamic_tick_arrays.clear();
@@ -116,16 +320,56 @@ impl Amm for ByrealClmm {
             }
         }
 
+        if dynamic_enabled() && self.amm.pool_state.is_swap_dynamic_fee_enabled() {
+            let (token0_pyth_oracle, token1_pyth_oracle) =
+                get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)?;
+
+            let (vault0_data, vault0_owner) =
+                try_get_account_data_and_owner(account_map, &self.amm.pool_state.token_vault_0)?;
+            self.amm.token0_vault_amount = decode_vault_amount(vault0_owner, vault0_data)?;
+            let (vault1_data, vault1_owner) =
+                try_get_account_data_and_owner(account_map, &self.amm.pool_state.token_vault_1)?;
+            self.amm.token1_vault_amount = decode_vault_amount(vault1_owner, vault1_data)?;
+
+            let (pyth0_data, pyth0_owner) =
+                try_get_account_data_and_owner(account_map, &token0_pyth_oracle)?;
+            if *pyth0_owner != PYTH_RECEIVER_PROGRAM_ID {
+                return Err(anyhow!("token0 pyth oracle owner mismatch"));
+            }
+            let (pyth1_data, pyth1_owner) =
+                try_get_account_data_and_owner(account_map, &token1_pyth_oracle)?;
+            if *pyth1_owner != PYTH_RECEIVER_PROGRAM_ID {
+                return Err(anyhow!("token1 pyth oracle owner mismatch"));
+            }
+            self.amm.token0_pyth_price = Some(decode_pyth_price(
+                pyth0_data,
+                &self.amm.pool_state.token0_pyth_feed_id,
+            )?);
+            self.amm.token1_pyth_price = Some(decode_pyth_price(
+                pyth1_data,
+                &self.amm.pool_state.token1_pyth_feed_id,
+            )?);
+        } else {
+            self.amm.token0_vault_amount = 0;
+            self.amm.token1_vault_amount = 0;
+            self.amm.token0_pyth_price = None;
+            self.amm.token1_pyth_price = None;
+        }
+
         Ok(())
     }
 
     fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {
+        if self.amm.pool_state.is_swap_dynamic_fee_enabled() {
+            if !dynamic_enabled() {
+                return Err(anyhow!("dynamic pool disabled by compile-time feature"));
+            }
+        }
+
         let current_timestamp = self.timestamp.load(std::sync::atomic::Ordering::Relaxed);
-        ensure!(
-            current_timestamp as u64 >= self.amm.pool_state.open_time,
-            "Pool is not open yet"
-        );
-        let zero_for_one = quote_params.input_mint == self.amm.pool_state.token_mint_0;
+        let current_epoch = self.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        let zero_for_one =
+            self.swap_direction_for_mints(quote_params.input_mint, quote_params.output_mint)?;
 
         let is_base_input = quote_params.swap_mode == SwapMode::ExactIn;
         let swap_result = self.amm.compute_swap(
@@ -134,6 +378,7 @@ impl Amm for ByrealClmm {
             is_base_input,
             None, // No price limit for quotes
             current_timestamp,
+            current_epoch,
         )?;
 
         Ok(Quote {
@@ -146,74 +391,26 @@ impl Amm for ByrealClmm {
     }
 
     fn get_swap_and_account_metas(&self, swap_params: &SwapParams) -> Result<SwapAndAccountMetas> {
-        let zero_for_one = swap_params.source_mint == self.amm.pool_state.token_mint_0;
-
-        // Build account metas for swap instruction (must match on-chain order)
-        let mut account_metas = vec![
-            // Signer (payer)
-            AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
-            // AMM Config
-            AccountMeta::new_readonly(self.amm.pool_state.amm_config, false),
-            // Pool state
-            AccountMeta::new(self.key, false),
-            // User token accounts (input, output)
-            AccountMeta::new(swap_params.source_token_account, false),
-            AccountMeta::new(swap_params.destination_token_account, false),
-            // Vaults (input, output)
-            if zero_for_one {
-                AccountMeta::new(self.amm.pool_state.token_vault_0, false)
-            } else {
-                AccountMeta::new(self.amm.pool_state.token_vault_1, false)
-            },
-            if zero_for_one {
-                AccountMeta::new(self.amm.pool_state.token_vault_1, false)
-            } else {
-                AccountMeta::new(self.amm.pool_state.token_vault_0, false)
-            },
-            // Observation state
-            AccountMeta::new(self.amm.pool_state.observation_key, false),
-            // Token program
-            AccountMeta::new_readonly(anchor_spl::token::ID, false),
-        ];
-
-        // Tick arrays for this swap:
-        // - start from directional candidates from get_swap_tick_arrays;
-        // - keep only those for which we actually have account bytes loaded
-        //   (so they are present in tick_arrays_raw and thus in LiteSVM);
-        // - if none of the directional candidates are present, fall back to
-        //   *any* tick arrays we have in tick_arrays_raw.
-        let candidate_tick_arrays = self.amm.get_swap_tick_arrays(zero_for_one);
-        let mut live_tick_arrays: Vec<Pubkey> = candidate_tick_arrays
-            .into_iter()
-            .filter(|addr| self.amm.dynamic_tick_arrays.contains_key(addr))
-            .collect();
-
-        if live_tick_arrays.is_empty() {
-            live_tick_arrays.extend(self.amm.dynamic_tick_arrays.keys().copied());
+        if self.amm.pool_state.is_swap_dynamic_fee_enabled() {
+            if !dynamic_enabled() {
+                return Err(anyhow!("dynamic pool disabled by compile-time feature"));
+            }
+            return Ok(SwapAndAccountMetas {
+                swap: Swap::RaydiumClmmV2,
+                account_metas: self.build_swap_v3_dyn_account_metas(swap_params)?,
+            });
         }
 
-        if live_tick_arrays.is_empty() {
-            return Err(anyhow!(
-                "No tick array accounts available for swap; cannot build account metas"
-            ));
-        }
-
-        // Primary tick array (named account in Anchor context)
-        let primary_tick_array = live_tick_arrays[0];
-        account_metas.push(AccountMeta::new(primary_tick_array, false));
-
-        // Bitmap extension (readonly) to support out-of-bound bitmaps
-        let bitmap_key = TickArrayBitmapExtension::key(self.key);
-        account_metas.push(AccountMeta::new_readonly(bitmap_key, false));
-
-        // Additional tick arrays as remaining accounts
-        for addr in live_tick_arrays.iter().skip(1) {
-            account_metas.push(AccountMeta::new(*addr, false));
+        if dynamic_enabled() {
+            return Ok(SwapAndAccountMetas {
+                swap: Swap::RaydiumClmmV2,
+                account_metas: self.build_swap_v3_dyn_account_metas(swap_params)?,
+            });
         }
 
         Ok(SwapAndAccountMetas {
-            swap: Swap::RaydiumClmm {},
-            account_metas,
+            swap: Swap::RaydiumClmmV2,
+            account_metas: self.build_swap_v2_account_metas(swap_params)?,
         })
     }
 
@@ -239,1397 +436,738 @@ impl Amm for ByrealClmm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use byreal_clmm_common::{tick_math, DynTickArrayState, TickArrayState, TickState};
-    use jupiter_amm_interface::ClockRef;
-    use solana_client::rpc_client::RpcClient;
-    use std::str::FromStr;
+    use byreal_clmm_common::TickArrayState;
 
+    fn build_dynamic_test_amm() -> ByrealClmm {
+        let pool_key = Pubkey::new_unique();
+        let mut pool_state = PoolState::default();
+        pool_state.amm_config = Pubkey::new_unique();
+        pool_state.token_mint_0 = Pubkey::new_unique();
+        pool_state.token_mint_1 = Pubkey::new_unique();
+        pool_state.token_vault_0 = Pubkey::new_unique();
+        pool_state.token_vault_1 = Pubkey::new_unique();
+        pool_state.observation_key = Pubkey::new_unique();
+        pool_state.tick_spacing = 1;
+        pool_state.token0_pyth_feed_id = [1u8; 32];
+        pool_state.token1_pyth_feed_id = [2u8; 32];
+        pool_state.set_swap_dynamic_fee_enabled(true);
+
+        ByrealClmm {
+            key: pool_key,
+            amm: ByrealClmmAmm {
+                key: pool_key,
+                pool_state,
+                amm_config: AmmConfig::default(),
+                bitmap_extension: Some(TickArrayBitmapExtension::default()),
+                max_one_side_tick_arrays: 3,
+                dynamic_tick_arrays: HashMap::new(),
+                token0_vault_amount: 0,
+                token1_vault_amount: 0,
+                token0_pyth_price: None,
+                token1_pyth_price: None,
+                token0_transfer_fee_config: None,
+                token1_transfer_fee_config: None,
+            },
+            timestamp: Arc::new(AtomicI64::new(0)),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn pool_state_account_data(pool_state: &PoolState) -> Vec<u8> {
+        let mut data = Vec::with_capacity(PoolState::LEN);
+        data.extend_from_slice(&PoolState::DISCRIMINATOR);
+        data.extend_from_slice(bytemuck::bytes_of(pool_state));
+        data
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn amm_config_account_data(config: &AmmConfig) -> Vec<u8> {
+        let mut data = Vec::new();
+        anchor_lang::AccountSerialize::try_serialize(config, &mut data).unwrap();
+        data
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn spl_vault_account_data(amount: u64) -> Vec<u8> {
+        let mut vault = spl_token::state::Account::default();
+        vault.state = spl_token::state::AccountState::Initialized;
+        vault.amount = amount;
+        let mut data = vec![0u8; spl_token::state::Account::LEN];
+        spl_token::state::Account::pack(vault, &mut data).unwrap();
+        data
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn pyth_price_account_data(feed_id: [u8; 32]) -> Vec<u8> {
+        let account = PriceUpdateV2 {
+            write_authority: Pubkey::new_unique(),
+            verification_level: pyth_solana_receiver_sdk::price_update::VerificationLevel::Full,
+            price_message: pyth_solana_receiver_sdk::price_update::PriceFeedMessage {
+                feed_id,
+                price: 1_000_000,
+                conf: 1,
+                exponent: -6,
+                publish_time: 100,
+                prev_publish_time: 99,
+                ema_price: 1_000_000,
+                ema_conf: 1,
+            },
+            posted_slot: 1,
+        };
+        let mut data = Vec::new();
+        anchor_lang::AccountSerialize::try_serialize(&account, &mut data).unwrap();
+        data
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn base_update_account_map(pool_key: Pubkey, pool_state: &PoolState) -> AccountMap {
+        let mut account_map = AccountMap::default();
+        account_map.insert(
+            pool_key,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: pool_state_account_data(pool_state),
+                owner: BYREAL_CLMM_PROGRAM,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            pool_state.amm_config,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: amm_config_account_data(&AmmConfig::default()),
+                owner: BYREAL_CLMM_PROGRAM,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            pool_state.token_mint_0,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: Vec::new(),
+                owner: spl_token::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            pool_state.token_mint_1,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: Vec::new(),
+                owner: spl_token::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    fn dynamic_update_account_map(
+        pool_key: Pubkey,
+        pool_state: &PoolState,
+        pyth0_owner: Pubkey,
+        pyth0_feed_id: [u8; 32],
+        pyth1_owner: Pubkey,
+        pyth1_feed_id: [u8; 32],
+    ) -> AccountMap {
+        let mut account_map = base_update_account_map(pool_key, pool_state);
+        account_map.insert(
+            pool_state.token_vault_0,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: spl_vault_account_data(1_000),
+                owner: spl_token::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            pool_state.token_vault_1,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: spl_vault_account_data(1_000),
+                owner: spl_token::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+
+        let (token0_pyth_oracle, token1_pyth_oracle) =
+            get_dynamic_pyth_oracle_addresses(pool_state).unwrap();
+        account_map.insert(
+            token0_pyth_oracle,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: pyth_price_account_data(pyth0_feed_id),
+                owner: pyth0_owner,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map.insert(
+            token1_pyth_oracle,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: pyth_price_account_data(pyth1_feed_id),
+                owner: pyth1_owner,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        account_map
+    }
+
+    #[cfg(not(feature = "dynamic-pool"))]
     #[test]
-    fn test_jupiter_integration() {
-        // Skip if not in integration test mode
-        if std::env::var("RUN_INTEGRATION_TESTS").is_err() {
-            println!("Skipping integration test. Set RUN_INTEGRATION_TESTS=1 to run.");
-            return;
-        }
+    fn test_dynamic_pool_disabled_rejects_quote_and_swap_metas() {
+        let mut pool_state = PoolState::default();
+        pool_state.token_mint_0 = Pubkey::new_unique();
+        pool_state.token_mint_1 = Pubkey::new_unique();
+        pool_state.set_swap_dynamic_fee_enabled(true);
 
-        // Example pool addresses (replace with actual pools)
-        // SOL-USDC pool on mainnet
-        let pool_address =
-            Pubkey::from_str("J4jiEPEu8c8nLdpkiMa7k1P8rL1HCJSNxCvzA5DsmYds").unwrap();
-
-        let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
-
-        // Fetch pool account
-        let account = rpc.get_account(&pool_address).unwrap();
-
-        let keyed_account = KeyedAccount {
-            key: pool_address,
-            account: account.into(),
-            params: None,
+        let pool_key = Pubkey::new_unique();
+        let amm = ByrealClmm {
+            key: pool_key,
+            amm: ByrealClmmAmm {
+                key: pool_key,
+                pool_state,
+                amm_config: AmmConfig::default(),
+                bitmap_extension: Some(TickArrayBitmapExtension::default()),
+                max_one_side_tick_arrays: 3,
+                dynamic_tick_arrays: HashMap::new(),
+                token0_vault_amount: 0,
+                token1_vault_amount: 0,
+                token0_pyth_price: None,
+                token1_pyth_price: None,
+                token0_transfer_fee_config: None,
+                token1_transfer_fee_config: None,
+            },
+            timestamp: Arc::new(AtomicI64::new(0)),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
-        // Create AMM context with default clock ref
-        let amm_context = AmmContext {
-            clock_ref: ClockRef::default(),
-        };
-
-        // Create AMM instance
-        let mut amm = ByrealClmm::from_keyed_account(&keyed_account, &amm_context).unwrap();
-
-        println!("Pool: {}", amm.key());
-        println!("Label: {}", amm.label());
-        println!("Program: {}", amm.program_id());
-
-        // Get accounts to update
-        let accounts_to_update = amm.get_accounts_to_update();
-        println!("Accounts to update: {}", accounts_to_update.len());
-
-        // Fetch all accounts
-        let accounts = rpc.get_multiple_accounts(&accounts_to_update).unwrap();
-        let account_map: AccountMap = accounts_to_update
-            .iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                accounts[i]
-                    .as_ref()
-                    .map(|account| (*key, account.clone().into()))
-            })
-            .collect();
-
-        // Update AMM state
-        amm.update(&account_map).unwrap();
-
-        // Debug: inspect discriminators for CLMM-owned accounts and our local
-        // type discriminators, to ensure we are selecting the correct
-        // tick_array accounts (fixed or dynamic).
-        println!(
-            "TickArrayState discriminator (SDK): {:?}",
-            TickArrayState::DISCRIMINATOR
-        );
-        println!(
-            "DynTickArrayState discriminator (SDK): {:?}",
-            DynTickArrayState::DISCRIMINATOR
-        );
-        for (addr, acc) in account_map.iter() {
-            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
-                continue;
-            }
-            let disc = &acc.data[0..8];
-            let kind = if disc == TickArrayState::DISCRIMINATOR {
-                "fixed_tick_array"
-            } else if disc == DynTickArrayState::DISCRIMINATOR {
-                "dyn_tick_array"
-            } else {
-                "other_clmm_account"
-            };
-            println!("CLMM account {} kind={} disc_bytes={:?}", addr, kind, disc);
-        }
-
-        // Test quotes
-        let mints = amm.get_reserve_mints();
-        println!("Reserve mints: {:?}", mints);
-
-        // Test exact in quote
-        let quote_in = amm
+        let quote_err = amm
             .quote(&QuoteParams {
-                amount: 100_000, // 0.0001 SOL
-                input_mint: mints[0],
-                output_mint: mints[1],
+                amount: 1_000,
+                input_mint: amm.amm.pool_state.token_mint_0,
+                output_mint: amm.amm.pool_state.token_mint_1,
                 swap_mode: SwapMode::ExactIn,
             })
-            .unwrap();
+            .unwrap_err();
+        assert!(format!("{quote_err:#}").contains("dynamic pool disabled by compile-time feature"));
 
-        println!("Quote (exact in):");
-        println!("  Input: {} {}", quote_in.in_amount, mints[0]);
-        println!("  Output: {} {}", quote_in.out_amount, mints[1]);
-        println!("  Fee: {}", quote_in.fee_amount);
-        println!("  Fee %: {}", quote_in.fee_pct);
-
-        // Test exact out quote
-        let quote_out = amm
-            .quote(&QuoteParams {
-                amount: quote_in.out_amount, // Same amount as output from previous quote
-                input_mint: mints[0],
-                output_mint: mints[1],
-                swap_mode: SwapMode::ExactOut,
+        let jupiter_program = Pubkey::new_unique();
+        let swap_err = amm
+            .get_swap_and_account_metas(&SwapParams {
+                source_mint: amm.amm.pool_state.token_mint_0,
+                destination_mint: amm.amm.pool_state.token_mint_1,
+                source_token_account: Pubkey::new_unique(),
+                destination_token_account: Pubkey::new_unique(),
+                token_transfer_authority: Pubkey::new_unique(),
+                quote_mint_to_referrer: None,
+                jupiter_program_id: &jupiter_program,
+                in_amount: 1_000,
+                out_amount: 1,
+                missing_dynamic_accounts_as_default: false,
+                swap_mode: SwapMode::ExactIn,
             })
-            .unwrap();
+            .err()
+            .expect("dynamic pool disabled should fail before producing swap metas");
+        assert!(format!("{swap_err:#}").contains("dynamic pool disabled by compile-time feature"));
+    }
 
-        println!("Quote (exact out):");
-        println!("  Input: {} {}", quote_out.in_amount, mints[0]);
-        println!("  Output: {} {}", quote_out.out_amount, mints[1]);
-        println!("  Fee: {}", quote_out.fee_amount);
+    #[test]
+    fn test_dynamic_pyth_oracle_addresses_reject_zero_feed_id() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
 
-        // Test swap account metas
+        let err = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap_err();
+        assert!(format!("{err:#}").contains("dynamic pool token0 pyth feed id is zero"));
+    }
+
+    #[test]
+    fn test_dynamic_pyth_oracle_addresses_reject_token1_zero_feed_id() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token1_pyth_feed_id = [0u8; 32];
+
+        let err = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap_err();
+        assert!(format!("{err:#}").contains("dynamic pool token1 pyth feed id is zero"));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_accounts_to_update_omit_invalid_zero_feed_pyth_accounts() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
+
+        let accounts = amm.get_accounts_to_update();
+
+        assert!(accounts.contains(&amm.amm.pool_state.token_vault_0));
+        assert!(accounts.contains(&amm.amm.pool_state.token_vault_1));
+        assert!(!accounts.contains(&get_price_feed_account_address(
+            PYTH_PRICE_SHARD_ID,
+            &[0u8; 32]
+        )));
+        assert!(!accounts.contains(&get_price_feed_account_address(
+            PYTH_PRICE_SHARD_ID,
+            &amm.amm.pool_state.token1_pyth_feed_id
+        )));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_update_loads_valid_pyth_prices_and_vault_amounts() {
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token0_pyth_feed_id,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        amm.update(&account_map).unwrap();
+
+        assert_eq!(amm.amm.token0_vault_amount, 1_000);
+        assert_eq!(amm.amm.token1_vault_amount, 1_000);
+        assert_eq!(amm.amm.token0_pyth_price.unwrap().price, 1_000_000);
+        assert_eq!(amm.amm.token1_pyth_price.unwrap().price, 1_000_000);
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_update_rejects_zero_feed_ids() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
+        let account_map = base_update_account_map(amm.key, &amm.amm.pool_state);
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("dynamic pool token0 pyth feed id is zero"));
+
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.token1_pyth_feed_id = [0u8; 32];
+        let account_map = base_update_account_map(amm.key, &amm.amm.pool_state);
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("dynamic pool token1 pyth feed id is zero"));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_update_rejects_pyth_owner_mismatch() {
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            Pubkey::new_unique(),
+            amm.amm.pool_state.token0_pyth_feed_id,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("token0 pyth oracle owner mismatch"));
+
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token0_pyth_feed_id,
+            Pubkey::new_unique(),
+            amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("token1 pyth oracle owner mismatch"));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_update_rejects_pyth_feed_id_mismatch() {
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            PYTH_RECEIVER_PROGRAM_ID,
+            [9u8; 32],
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token1_pyth_feed_id,
+        );
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("pyth feed id mismatch"));
+
+        let mut amm = build_dynamic_test_amm();
+        let account_map = dynamic_update_account_map(
+            amm.key,
+            &amm.amm.pool_state,
+            PYTH_RECEIVER_PROGRAM_ID,
+            amm.amm.pool_state.token0_pyth_feed_id,
+            PYTH_RECEIVER_PROGRAM_ID,
+            [9u8; 32],
+        );
+
+        let err = amm.update(&account_map).unwrap_err();
+        assert!(format!("{err:#}").contains("pyth feed id mismatch"));
+    }
+
+    #[test]
+    fn test_quote_rejects_mints_outside_pool_reserves() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.set_swap_dynamic_fee_enabled(false);
+
+        let err = amm
+            .quote(&QuoteParams {
+                amount: 1,
+                input_mint: Pubkey::new_unique(),
+                output_mint: amm.amm.pool_state.token_mint_1,
+                swap_mode: SwapMode::ExactIn,
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("swap mints do not match pool reserves"));
+    }
+
+    #[test]
+    fn test_non_dynamic_swap_metas_reject_mints_outside_pool_reserves() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.set_swap_dynamic_fee_enabled(false);
+        let jupiter_program = Pubkey::new_unique();
+
+        let err = match amm.get_swap_and_account_metas(&SwapParams {
+            source_mint: Pubkey::new_unique(),
+            destination_mint: amm.amm.pool_state.token_mint_1,
+            source_token_account: Pubkey::new_unique(),
+                destination_token_account: Pubkey::new_unique(),
+                token_transfer_authority: Pubkey::new_unique(),
+                quote_mint_to_referrer: None,
+                jupiter_program_id: &jupiter_program,
+                in_amount: 1,
+            out_amount: 1,
+            missing_dynamic_accounts_as_default: false,
+            swap_mode: SwapMode::ExactIn,
+        }) {
+            Ok(_) => panic!("swap metas should reject mints outside pool reserves"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("swap mints do not match pool reserves"));
+    }
+
+    #[test]
+    fn test_non_dynamic_pool_returns_v2_compatible_metas() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.set_swap_dynamic_fee_enabled(false);
+        let first_tick_array = amm.amm.get_swap_tick_arrays(true)[0];
+        amm.amm.dynamic_tick_arrays.insert(
+            first_tick_array,
+            DynamicTickArrayState::Fixed(TickArrayState::default()),
+        );
+
         let jupiter_program = Pubkey::new_unique();
         let swap_params = SwapParams {
-            source_mint: mints[0],
-            destination_mint: mints[1],
+            source_mint: amm.amm.pool_state.token_mint_0,
+            destination_mint: amm.amm.pool_state.token_mint_1,
             source_token_account: Pubkey::new_unique(),
             destination_token_account: Pubkey::new_unique(),
             token_transfer_authority: Pubkey::new_unique(),
             quote_mint_to_referrer: None,
             jupiter_program_id: &jupiter_program,
-            in_amount: quote_in.in_amount,
-            out_amount: quote_in.out_amount,
+            in_amount: 1_000,
+            out_amount: 1,
             missing_dynamic_accounts_as_default: false,
             swap_mode: SwapMode::ExactIn,
         };
 
-        let swap_and_metas = amm.get_swap_and_account_metas(&swap_params).unwrap();
-        println!("Swap accounts: {}", swap_and_metas.account_metas.len());
+        let swap = amm.get_swap_and_account_metas(&swap_params).unwrap();
 
-        // Verify dynamic accounts
-        assert!(amm.has_dynamic_accounts());
+        assert_eq!(swap.swap, Swap::RaydiumClmmV2);
+        assert_eq!(swap.account_metas[9].pubkey, spl_token_2022::ID);
+        assert_eq!(swap.account_metas[10].pubkey, anchor_spl::memo::ID);
+        assert_eq!(swap.account_metas[11].pubkey, amm.amm.pool_state.token_mint_0);
+        assert_eq!(swap.account_metas[12].pubkey, amm.amm.pool_state.token_mint_1);
+        assert_eq!(swap.account_metas[13].pubkey, TickArrayBitmapExtension::key(amm.key));
+        assert_eq!(swap.account_metas[14].pubkey, first_tick_array);
     }
 
+    #[cfg(feature = "dynamic-pool")]
     #[test]
-    fn test_tick_array_address_calculation() {
-        let pool_key = Pubkey::new_unique();
-
-        // Create a mock AMM
-        let amm = ByrealClmmAmm {
-            key: pool_key,
-            pool_state: PoolState::default(),
-            amm_config: AmmConfig::default(),
-            dynamic_tick_arrays: HashMap::new(),
-            max_one_side_tick_arrays: 3,
-            bitmap_extension: None,
-        };
-
-        // Test tick array address generation
-        let tick_array_addr = amm.get_tick_array_address(0);
-        assert_ne!(tick_array_addr, Pubkey::default());
-
-        // Test different start indices
-        let addr1 = amm.get_tick_array_address(100);
-        let addr2 = amm.get_tick_array_address(200);
-        assert_ne!(addr1, addr2);
-    }
-
-    #[test]
-    fn test_swap_direction_tick_arrays() {
-        let pool_key = Pubkey::new_unique();
-
-        let mut pool_state = PoolState::default();
-        pool_state.tick_current = 1000;
-        pool_state.tick_spacing = 10;
-
-        let amm = ByrealClmmAmm {
-            key: pool_key,
-            pool_state,
-            amm_config: AmmConfig::default(),
-            dynamic_tick_arrays: HashMap::new(),
-            max_one_side_tick_arrays: 3,
-            bitmap_extension: None,
-        };
-
-        // Test zero_for_one (price decreasing)
-        let arrays_down = amm.get_swap_tick_arrays(true);
-        assert_eq!(arrays_down.len(), 3);
-
-        // Test one_for_zero (price increasing)
-        let arrays_up = amm.get_swap_tick_arrays(false);
-        assert_eq!(arrays_up.len(), 3);
-
-        // Verify they're different
-        assert_ne!(arrays_down[1], arrays_up[1]);
-    }
-
-    #[test]
-    fn test_decay_fee_calculation() {
-        let pool_key = Pubkey::new_unique();
-
-        let mut pool_state = PoolState::default();
-        pool_state.tick_current = 1000;
-        pool_state.tick_spacing = 10;
-        pool_state.open_time = 0; // Pool opened at timestamp 0
-        pool_state.decay_fee_flag = 0b111; // Enable decay fee for both directions
-        pool_state.decay_fee_init_fee_rate = 80; // 80% initial fee
-        pool_state.decay_fee_decrease_rate = 10; // 10% decrease per interval
-        pool_state.decay_fee_decrease_interval = 10; // 10 seconds per interval
-
-        let mut amm_config = AmmConfig::default();
-        amm_config.trade_fee_rate = 2500; // 0.25% base fee (2500 / 10^6)
-
-        let amm = ByrealClmmAmm {
-            key: pool_key,
-            pool_state,
-            amm_config: AmmConfig::default(),
-            dynamic_tick_arrays: HashMap::new(),
-            max_one_side_tick_arrays: 3,
-            bitmap_extension: None,
-        };
-
-        // Test decay fee enabled
-        assert!(amm.is_decay_fee_enabled());
-        assert!(amm.is_decay_fee_on_sell_mint0());
-        assert!(amm.is_decay_fee_on_sell_mint1());
-
-        // Test decay fee at different intervals
-        // Interval 0: timestamp 0-9, fee = 80%
-        let fee_rate = amm.get_decay_fee_rate(0);
-        assert_eq!(fee_rate, Some(800_000)); // 80% = 800,000 / 10^6
-
-        let fee_rate = amm.get_decay_fee_rate(9);
-        assert_eq!(fee_rate, Some(800_000)); // Still 80%
-
-        // Interval 1: timestamp 10-19, fee = 72%
-        let fee_rate = amm.get_decay_fee_rate(10);
-        assert_eq!(fee_rate, Some(720_000)); // 72% = 720,000 / 10^6
-
-        let fee_rate = amm.get_decay_fee_rate(19);
-        assert_eq!(fee_rate, Some(720_000)); // Still 72%
-
-        // Interval 2: timestamp 20-29, fee = 64.8%
-        let fee_rate = amm.get_decay_fee_rate(20);
-        assert_eq!(fee_rate, Some(648_000)); // 64.8% = 648,000 / 10^6
-
-        // Interval 3: timestamp 30-39, fee = 58.32%
-        let fee_rate = amm.get_decay_fee_rate(30);
-        assert_eq!(fee_rate, Some(583_200)); // 58.32% = 583,200 / 10^6
-
-        // Test after many intervals (should approach 0)
-        let fee_rate = amm.get_decay_fee_rate(1000);
-        assert!(fee_rate.is_some() && fee_rate.unwrap() < 100); // Should be very small after 100 intervals
-    }
-
-    #[test]
-    fn test_decay_fee_disabled() {
-        let pool_key = Pubkey::new_unique();
-
-        let mut pool_state = PoolState::default();
-        pool_state.decay_fee_flag = 0; // Decay fee disabled
-
-        let amm = ByrealClmmAmm {
-            key: pool_key,
-            pool_state,
-            amm_config: AmmConfig::default(),
-            dynamic_tick_arrays: HashMap::new(),
-            max_one_side_tick_arrays: 3,
-            bitmap_extension: None,
-        };
-
-        assert!(!amm.is_decay_fee_enabled());
-        assert_eq!(amm.get_decay_fee_rate(100), Some(0));
-    }
-
-    #[test]
-    fn test_decay_fee_before_open_time() {
-        let pool_key = Pubkey::new_unique();
-
-        let mut pool_state = PoolState::default();
-        pool_state.open_time = 1000; // Pool opens at timestamp 1000
-        pool_state.decay_fee_flag = 0b111; // Enable decay fee
-        pool_state.decay_fee_init_fee_rate = 50;
-        pool_state.decay_fee_decrease_interval = 10; // Set interval to avoid division by zero
-
-        let amm = ByrealClmmAmm {
-            key: pool_key,
-            pool_state,
-            amm_config: AmmConfig::default(),
-            dynamic_tick_arrays: HashMap::new(),
-            max_one_side_tick_arrays: 3,
-            bitmap_extension: None,
-        };
-
-        // Before open time, fee should be 0
-        assert_eq!(amm.get_decay_fee_rate(999), Some(0));
-
-        // At open time, fee should be initial rate
-        assert_eq!(amm.get_decay_fee_rate(1000), Some(500_000)); // 50% = 500,000 / 10^6
-    }
-
-    #[test]
-    fn test_decode_dyn_tick_array_and_next_tick() {
-        // Helper to build a minimal dynamic tick array bytes blob
-        fn build_dyn_bytes(start: i32, spacing: u16, offsets: &[usize]) -> Vec<u8> {
-            let mut header = DynTickArrayState::default();
-            header.start_tick_index = start;
-            header.alloc_tick_count = offsets.len() as u8;
-            // Map offsets to 1-based indices
-            for (i, off) in offsets.iter().enumerate() {
-                header.tick_offset_index[*off] = (i as u8) + 1;
-            }
-            let mut ticks: Vec<TickState> = Vec::with_capacity(offsets.len());
-            for off in offsets.iter() {
-                let mut t = TickState::default();
-                t.tick = start + (*off as i32) * (spacing as i32);
-                t.liquidity_gross = 1; // mark initialized
-                ticks.push(t);
-            }
-            let mut data = Vec::new();
-            data.extend_from_slice(&DynTickArrayState::DISCRIMINATOR);
-            data.extend_from_slice(bytemuck::bytes_of(&header));
-            data.extend_from_slice(bytemuck::cast_slice(&ticks));
-            data
-        }
-
-        // Synthetic dynamic tick array with initialized ticks at offsets
-        // 0 (600), 2 (620) and 5 (650) for spacing=10.
-        let spacing: u16 = 10;
-        let start: i32 = 600;
-        let bytes = build_dyn_bytes(start, spacing, &[0, 2, 5]);
-
-        let (header, ticks) = match DynamicTickArrayState::from_bytes(&bytes).unwrap() {
-            DynamicTickArrayState::Dynamic(inner) => inner,
-            _ => panic!("Expected Dynamic variant"),
-        };
-        let header_start = header.start_tick_index;
-        assert_eq!(header_start, start);
-        assert_eq!(header.alloc_tick_count, 3);
-        assert_eq!(ticks.len(), 3);
-        let t0 = ticks[0].tick;
-        let t1 = ticks[1].tick;
-        let t2 = ticks[2].tick;
-        assert_eq!(t0, start);
-        assert_eq!(t1, start + 2 * i32::from(spacing));
-        assert_eq!(t2, start + 5 * i32::from(spacing));
-
-        // zero_for_one=true (price decreasing): from tick just above 650, the
-        // next initialized tick inside this array should be 650.
-        let current_tick_down = start + 5 * i32::from(spacing) + 1; // 651
-        let idx_down = header
-            .next_initialized_tick_index(&ticks, current_tick_down, spacing, true)
-            .unwrap()
-            .unwrap();
-        let tick_down = ticks[idx_down as usize].tick;
-        assert_eq!(tick_down, start + 5 * i32::from(spacing));
-
-        // zero_for_one=false (price increasing): the first initialized tick in
-        // this array should be 600.
-        let idx_up = header.first_initialized_tick_index(&ticks, false).unwrap();
-        let tick_up = ticks[idx_up as usize].tick;
-        assert_eq!(tick_up, start);
-    }
-
-    #[test]
-    fn test_compute_swap_errors_when_not_enough_tick_arrays() {
-        let pool_key = Pubkey::new_unique();
-
-        // Minimal pool state with some liquidity so that compute_swap would
-        // attempt to walk ticks, but we deliberately do not provide any
-        // tick array account data.
-        let mut pool_state = PoolState::default();
-        pool_state.tick_spacing = 10;
-        pool_state.tick_current = 0;
-        pool_state.sqrt_price_x64 = tick_math::get_sqrt_price_at_tick(0).unwrap();
-        pool_state.liquidity = 1_000_000u128;
-
-        let amm = ByrealClmmAmm {
-            key: pool_key,
-            pool_state,
-            amm_config: AmmConfig::default(),
-            dynamic_tick_arrays: HashMap::new(),
-            max_one_side_tick_arrays: 3,
-            bitmap_extension: None,
-        };
-
-        // Attempting to compute a swap without tick array data should now
-        // surface an error instead of silently falling back.
-        let res = amm.compute_swap(true, 1_000u64, true, None, 0);
-        assert!(res.is_err());
-    }
-
-    /// LiteSVM vs SDK quote test for the Byreal JUP/USDC CLMM pool.
-    ///
-    /// This test:
-    /// - fetches pool + tick-array snapshot from mainnet,
-    /// - computes SDK quote via `Amm::quote`,
-    /// - sets the same accounts into a LiteSVM VM with the byreal_clmm BPF binary,
-    /// - simulates a `swap` instruction,
-    /// - compares the user output amount between LiteSVM and SDK math.
-    #[cfg(feature = "with-litesvm")]
-    #[test]
-    #[ignore]
-    fn test_litesvm_vs_sdk_byreal_jup_usdc() {
-        use litesvm::LiteSVM;
-        use solana_account::Account as RawAccount;
-        use solana_client::rpc_request::TokenAccountsFilter;
-        use solana_clock::Clock as RawClock;
-        use solana_instruction::{
-            account_meta::AccountMeta as RawAccountMeta, Instruction as RawInstruction,
-        };
-        use solana_message::Message as RawMessage;
-        use solana_pubkey::Pubkey as RawPubkey;
-        use solana_transaction::Transaction as RawTransaction;
-
-        // 1. Build SDK AMM from mainnet snapshot
-        let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
-        // Byreal (cbBTC-USDC) pool used by aggregator
-        let pool_address =
-            Pubkey::from_str("A5vkCw1VXPNXq5VFbffPm6Bo4kVKAP1UUoRrEn3gyVey").unwrap();
-        // USDC is fixed; cbBTC mint is derived from pool and cross‑checked against the known mint.
-        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
-
-        let account = rpc.get_account(&pool_address).unwrap();
-        let keyed_account = KeyedAccount {
-            key: pool_address,
-            account: account.into(),
-            params: None,
-        };
-        let amm_context = AmmContext {
-            clock_ref: ClockRef::default(),
-        };
-        let mut amm = ByrealClmmAmm::from_keyed_account(&keyed_account, &amm_context).unwrap();
-
-        // Build the full account list the SDK believes is needed for this pool,
-        // including pool state, vaults, config, observation, bitmap extension
-        // and all candidate tick array PDAs.
-        let accounts_to_update = amm.get_accounts_to_update();
-        let accounts = rpc.get_multiple_accounts(&accounts_to_update).unwrap();
-        let mut account_map: AccountMap = accounts_to_update
-            .iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                accounts[i]
-                    .as_ref()
-                    .map(|account| (*key, account.clone().into()))
-            })
-            .collect();
-        amm.update(&account_map).unwrap();
-
-        // Derive cbBTC mint from pool state (the non-USDC side) and sanity‑check
-        // against the expected cbBTC mint used by the aggregator.
-        let expected_cb_btc_mint =
-            Pubkey::from_str("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij").unwrap();
-        let cb_btc_mint = if amm.pool_state.token_mint_0 == usdc_mint {
-            amm.pool_state.token_mint_1
-        } else if amm.pool_state.token_mint_1 == usdc_mint {
-            amm.pool_state.token_mint_0
-        } else {
-            panic!(
-                "Pool {} is not a USDC-cbBTC pool (mints: {}, {})",
-                pool_address, amm.pool_state.token_mint_0, amm.pool_state.token_mint_1
-            );
-        };
-        assert_eq!(
-            cb_btc_mint, expected_cb_btc_mint,
-            "Pool {} cbBTC mint mismatch (pool side vs expected)",
-            pool_address
+    fn test_non_dynamic_pool_feature_on_does_not_require_pyth_metas() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.set_swap_dynamic_fee_enabled(false);
+        amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
+        amm.amm.pool_state.token1_pyth_feed_id = [0u8; 32];
+        let first_tick_array = amm.amm.get_swap_tick_arrays(true)[0];
+        amm.amm.dynamic_tick_arrays.insert(
+            first_tick_array,
+            DynamicTickArrayState::Fixed(TickArrayState::default()),
         );
 
-        // Ensure we have *all* tick array accounts that the on-chain program
-        // may touch, based on the bitmap navigation helpers, not just the
-        // subset returned by get_accounts_to_update(). Otherwise the program
-        // can legitimately throw NotEnoughTickArrayAccount while the SDK
-        // math succeeds.
-        let mut full_tick_addrs: HashSet<Pubkey> = HashSet::new();
-        for &dir in &[true, false] {
-            if let Ok((_, mut start)) = amm
-                .pool_state
-                .get_first_initialized_tick_array(&amm.bitmap_extension, dir)
-            {
-                loop {
-                    full_tick_addrs.insert(amm.get_tick_array_address(start));
-                    match amm.pool_state.next_initialized_tick_array_start_index(
-                        &amm.bitmap_extension,
-                        start,
-                        dir,
-                    ) {
-                        Ok(Some(next)) => {
-                            start = next;
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-        for addr in full_tick_addrs.into_iter() {
-            if !account_map.contains_key(&addr) {
-                if let Ok(acc) = rpc.get_account(&addr) {
-                    account_map.insert(addr, acc.into());
-                }
-            }
-        }
-        // Re-sync AMM with the enriched account map so that both SDK math and
-        // LiteSVM simulation see the same complete tick array set.
-        amm.update(&account_map).unwrap();
-
-        // Log decay-fee related configuration for this pool so we can see
-        // whether dynamic fee is enabled and on which side it applies.
-        println!(
-            "Pool decay_fee_flag={}, init_rate={}, decrease_rate={}, interval={}",
-            amm.pool_state.decay_fee_flag,
-            amm.pool_state.decay_fee_init_fee_rate,
-            amm.pool_state.decay_fee_decrease_rate,
-            amm.pool_state.decay_fee_decrease_interval,
-        );
-        println!(
-            "Decay fee enabled={}, on_sell_mint0={}, on_sell_mint1={}",
-            amm.is_decay_fee_enabled(),
-            amm.is_decay_fee_on_sell_mint0(),
-            amm.is_decay_fee_on_sell_mint1(),
-        );
-        println!(
-            "Base trade_fee_rate={}, protocol_fee_rate={}, fund_fee_rate={}",
-            amm.amm_config.trade_fee_rate,
-            amm.amm_config.protocol_fee_rate,
-            amm.amm_config.fund_fee_rate,
-        );
-
-        // Debug: print SDK-side discriminators and CLMM-owned accounts'
-        // first 8 bytes to verify which accounts are actually tick arrays
-        // from the program's perspective (fixed or dynamic).
-        println!(
-            "TickArrayState discriminator (SDK): {:?}",
-            TickArrayState::DISCRIMINATOR
-        );
-        println!(
-            "DynTickArrayState discriminator (SDK): {:?}",
-            DynTickArrayState::DISCRIMINATOR
-        );
-        for (addr, acc) in account_map.iter() {
-            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
-                continue;
-            }
-            let disc = &acc.data[0..8];
-            let kind = if disc == TickArrayState::DISCRIMINATOR {
-                "fixed_tick_array"
-            } else if disc == DynTickArrayState::DISCRIMINATOR {
-                "dyn_tick_array"
-            } else {
-                "other_clmm_account"
-            };
-            println!("CLMM account {} kind={} disc_bytes={:?}", addr, kind, disc);
-        }
-
-        // Discover user's cbBTC/USDC token accounts for this test case
-        let user = Pubkey::from_str("DdZR6zRFiUt4S5mg7AV1uKB2z1f1WzcNYCaTEEWPAuby").unwrap();
-        let cb_btc_accounts = rpc
-            .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(cb_btc_mint))
-            .unwrap();
-        let usdc_accounts = rpc
-            .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(usdc_mint))
-            .unwrap();
-        if cb_btc_accounts.is_empty() || usdc_accounts.is_empty() {
-            println!("User missing cbBTC or USDC ATA; skipping LiteSVM test.");
-            return;
-        }
-        let cb_btc_ata = Pubkey::from_str(&cb_btc_accounts[0].pubkey).unwrap();
-        let usdc_ata = Pubkey::from_str(&usdc_accounts[0].pubkey).unwrap();
-
-        // Use the same input amount as the aggregator scenario: 1_250_000 cbBTC base units.
-        let amount_in: u64 = 1_250_000;
-        if amount_in == 0 {
-            println!(
-                "User USDC ATA {} has insufficient balance; skipping LiteSVM test.",
-                usdc_ata
-            );
-            return;
-        }
-
-        // SDK quote baseline: cbBTC -> USDC (ExactIn)
-        let sdk_quote = amm
-            .quote(&QuoteParams {
-                amount: amount_in,
-                input_mint: cb_btc_mint,
-                output_mint: usdc_mint,
+        let jupiter_program = Pubkey::new_unique();
+        let swap = amm
+            .get_swap_and_account_metas(&SwapParams {
+                source_mint: amm.amm.pool_state.token_mint_0,
+                destination_mint: amm.amm.pool_state.token_mint_1,
+                source_token_account: Pubkey::new_unique(),
+                destination_token_account: Pubkey::new_unique(),
+                token_transfer_authority: Pubkey::new_unique(),
+                quote_mint_to_referrer: None,
+                jupiter_program_id: &jupiter_program,
+                in_amount: 1_000,
+                out_amount: 1,
+                missing_dynamic_accounts_as_default: false,
                 swap_mode: SwapMode::ExactIn,
             })
             .unwrap();
-        println!(
-            "SDK quote: in={}, out={}, fee={}",
-            sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
-        );
 
-        // 2. Build LiteSVM VM and load Byreal CLMM BPF program
-        let mut svm = LiteSVM::new()
-            .with_sysvars()
-            .with_builtins()
-            .with_default_programs()
-            .with_sigverify(false)
-            .with_blockhash_check(false);
-
-        // Path is relative to this crate's src/, use two levels up.
-        let program_bytes = include_bytes!("./byreal_clmm.so");
-        let clmm_program = RawPubkey::new_from_array(BYREAL_CLMM_PROGRAM.to_bytes());
-        svm.add_program(clmm_program, program_bytes).unwrap();
-
-        // 3. Write the same pool/tick/aux accounts into LiteSVM
-        for (addr, acc) in account_map.iter() {
-            let raw_addr = RawPubkey::new_from_array(addr.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: acc.data.clone(),
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-
-        // Also write user cbBTC/USDC token accounts from mainnet snapshot.
-        // For cbBTC ATA, ensure the simulated balance is sufficient to
-        // cover the input amount, so we don't fail with "insufficient
-        // funds" while validating math.
-        {
-            let acc = rpc.get_account(&cb_btc_ata).unwrap();
-            let mut cbbtc_data = acc.data.clone();
-            if let Ok(mut token_acc) =
-                anchor_spl::token::spl_token::state::Account::unpack(&cbbtc_data)
-            {
-                if token_acc.amount < amount_in {
-                    token_acc.amount = amount_in.saturating_mul(2);
-                    let mut new_data = vec![0u8; cbbtc_data.len()];
-                    anchor_spl::token::spl_token::state::Account::pack(token_acc, &mut new_data)
-                        .unwrap();
-                    cbbtc_data = new_data;
-                }
-            }
-            let raw_addr = RawPubkey::new_from_array(cb_btc_ata.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: cbbtc_data,
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-        {
-            let acc = rpc.get_account(&usdc_ata).unwrap();
-            let raw_addr = RawPubkey::new_from_array(usdc_ata.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: acc.data,
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-
-        // Ensure user lamport account exists in LiteSVM via airdrop
-        let user_raw = RawPubkey::new_from_array(user.to_bytes());
-        svm.airdrop(&user_raw, 1_000_000_000).unwrap();
-
-        // Align LiteSVM clock so that swap pool is considered "open".
-        // The on-chain program requires block_timestamp > pool_state.open_time.
-        let mut clock_sysvar: RawClock = svm.get_sysvar();
-        // pool_state.open_time is u64 seconds; set VM clock just after that.
-        clock_sysvar.unix_timestamp = (amm.pool_state.open_time as i64).saturating_add(1);
-        svm.set_sysvar(&clock_sysvar);
-
-        // 4. Construct swap instruction accounts directly from the snapshot.
-        //    First, follow the on-chain bitmap navigation to compute the
-        //    ordered tick_array start indices in the swap direction, so that
-        //    the tick_array_states queue matches the program's expectations
-        //    and avoids NotEnoughTickArrayAccount due to ordering issues.
-        //    Here we simulate cbBTC -> USDC, so zero_for_one is decided by cbBTC mint.
-        let zero_for_one = cb_btc_mint == amm.pool_state.token_mint_0;
-        let (input_vault, output_vault) = if zero_for_one {
-            (amm.pool_state.token_vault_0, amm.pool_state.token_vault_1)
-        } else {
-            (amm.pool_state.token_vault_1, amm.pool_state.token_vault_0)
-        };
-
-        // All accounts in the snapshot that look like tick arrays (used as fallback)
-        let mut all_tick_arrays: Vec<Pubkey> = Vec::new();
-        for (addr, acc) in account_map.iter() {
-            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
-                continue;
-            }
-            let disc = &acc.data[0..8];
-            if disc == DynTickArrayState::DISCRIMINATOR || disc == TickArrayState::DISCRIMINATOR {
-                all_tick_arrays.push(*addr);
-            }
-        }
-        if all_tick_arrays.is_empty() {
-            panic!("No tick array accounts with valid discriminator found in snapshot");
-        }
-
-        // Traverse all initialized tick_array start indices in the current
-        // swap direction using pool_state + bitmap_extension to derive an
-        // ordered list of tick_array addresses.
-        let mut ordered_tick_arrays: Vec<Pubkey> = Vec::new();
-        if let Ok((_, mut start)) = amm
-            .pool_state
-            .get_first_initialized_tick_array(&amm.bitmap_extension, zero_for_one)
-        {
-            loop {
-                let addr = amm.get_tick_array_address(start);
-                if account_map.contains_key(&addr) {
-                    ordered_tick_arrays.push(addr);
-                }
-                match amm.pool_state.next_initialized_tick_array_start_index(
-                    &amm.bitmap_extension,
-                    start,
-                    zero_for_one,
-                ) {
-                    Ok(Some(next)) => {
-                        start = next;
-                    }
-                    _ => break,
-                }
-            }
-        }
-
-        // If bitmap navigation yields nothing (e.g. missing bitmap_extension),
-        // fall back to the full set of known tick_array accounts to ensure
-        // the set is never empty.
-        if ordered_tick_arrays.is_empty() {
-            ordered_tick_arrays.extend(all_tick_arrays.iter().copied());
-        }
-        if ordered_tick_arrays.is_empty() {
-            panic!("No ordered tick array accounts available for swap");
-        }
-
-        println!("Selected tick_array candidates (ordered_tick_arrays):");
-        for addr in ordered_tick_arrays.iter() {
-            if let Some(acc) = account_map.get(addr) {
-                let disc = if acc.data.len() >= 8 {
-                    Some(&acc.data[0..8])
-                } else {
-                    None
-                };
-                println!("- {} disc_bytes={:?}", addr, disc);
-            }
-        }
-
-        #[derive(anchor_lang::AnchorSerialize, anchor_lang::AnchorDeserialize)]
-        struct SwapIxArgs {
-            amount: u64,
-            other_amount_threshold: u64,
-            sqrt_price_limit_x64: u128,
-            is_base_input: bool,
-        }
-
-        // Discriminator for `swap` from byreal_clmm IDL
-        let mut data = vec![248u8, 198, 158, 145, 225, 117, 135, 200];
-        data.extend(
-            SwapIxArgs {
-                amount: amount_in,
-                other_amount_threshold: 0,
-                sqrt_price_limit_x64: 0,
-                is_base_input: true,
-            }
-            .try_to_vec()
-            .unwrap(),
-        );
-
-        // Build accounts following byreal_clmm `swap` IDL:
-        // payer, amm_config, pool_state, input_token_account, output_token_account,
-        // input_vault, output_vault, observation_state, token_program, tick_array,
-        // then remaining_accounts: bitmap extension (if any) + other tick arrays,
-        // in the exact order computed in ordered_tick_arrays.
-        let mut accounts: Vec<RawAccountMeta> = Vec::new();
-
-        // payer (signer)
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(user.to_bytes()),
-            is_signer: true,
-            is_writable: false,
-        });
-        // amm_config
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.pool_state.amm_config.to_bytes()),
-            is_signer: false,
-            is_writable: false,
-        });
-        // pool_state
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.key.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // input / output user token accounts (cbBTC -> USDC)
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(cb_btc_ata.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(usdc_ata.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // input / output vaults
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(input_vault.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(output_vault.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // observation_state
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.pool_state.observation_key.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // token_program
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(anchor_spl::token::ID.to_bytes()),
-            is_signer: false,
-            is_writable: false,
-        });
-
-        // Primary tick array (named account in SwapSingle)
-        let primary_tick_array = ordered_tick_arrays[0];
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(primary_tick_array.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-
-        // Remaining accounts: bitmap extension (if present) then other tick arrays
-        let bitmap_key = TickArrayBitmapExtension::key(amm.key);
-        if account_map.contains_key(&bitmap_key) {
-            accounts.push(RawAccountMeta {
-                pubkey: RawPubkey::new_from_array(bitmap_key.to_bytes()),
-                is_signer: false,
-                is_writable: false,
-            });
-        }
-        for addr in ordered_tick_arrays.iter().skip(1) {
-            accounts.push(RawAccountMeta {
-                pubkey: RawPubkey::new_from_array(addr.to_bytes()),
-                is_signer: false,
-                is_writable: true,
-            });
-        }
-
-        let raw_ix = RawInstruction {
-            program_id: clmm_program,
-            accounts,
-            data,
-        };
-
-        // Use the real user as fee payer in the message so LiteSVM's
-        // fee-payer validation passes (we already airdropped lamports
-        // to `user_raw` above).
-        let msg = RawMessage::new(&[raw_ix], Some(&user_raw));
-        // Construct an unsigned transaction; LiteSVM is configured with
-        // `with_sigverify(false)` and `with_blockhash_check(false)`, so we
-        // don't need real signatures here, only the correct signer layout.
-        let tx = RawTransaction::new_unsigned(msg);
-
-        // 5. Simulate transaction in LiteSVM
-        let sim = svm
-            .simulate_transaction(tx)
-            .expect("LiteSVM simulate_transaction should succeed");
-
-        #[cfg(feature = "debug-swap-steps")]
-        println!("LiteSVM logs: {:?}", sim.meta.logs);
-
-        // Find post-simulated USDC ATA and compute out amount
-        let usdc_raw = RawPubkey::new_from_array(usdc_ata.to_bytes());
-        let mut post_usdc_amount: Option<u64> = None;
-        for (pk, acc) in sim.post_accounts.iter() {
-            if *pk == usdc_raw {
-                let raw: RawAccount = (*acc).clone().into();
-                if let Ok(token_acc) =
-                    anchor_spl::token::spl_token::state::Account::unpack(&raw.data)
-                {
-                    post_usdc_amount = Some(token_acc.amount);
-                }
-            }
-        }
-
-        if post_usdc_amount.is_none() {
-            println!("LiteSVM did not modify USDC ATA; logs: {:?}", sim.meta.logs);
-            return;
-        }
-
-        let pre_usdc_acc = rpc.get_account(&usdc_ata).unwrap();
-        let pre_usdc_token =
-            anchor_spl::token::spl_token::state::Account::unpack(&pre_usdc_acc.data).unwrap();
-        let pre_amount = pre_usdc_token.amount;
-        let post_amount = post_usdc_amount.unwrap();
-        let litesvm_out = post_amount.saturating_sub(pre_amount);
-
-        println!(
-            "LiteSVM out={}, diff (sdk_math - litesvm)={}",
-            litesvm_out,
-            sdk_quote.out_amount.saturating_sub(litesvm_out)
-        );
-
-        // In ideal case we expect exact match; for now just print diff for inspection.
+        assert_eq!(swap.swap, Swap::RaydiumClmmV2);
+        assert_eq!(swap.account_metas.len(), 15);
+        assert_eq!(swap.account_metas[14].pubkey, first_tick_array);
     }
 
-    /// LiteSVM vs SDK quote test (ExactOut) for the Byreal cbBTC/USDC CLMM pool.
-    ///
-    /// Scenario:
-    /// - Same pool / snapshot as `test_litesvm_vs_sdk_byreal_jup_usdc`;
-    /// - Direction: cbBTC -> USDC, user wants EXACT_OUT of 2000 USDC;
-    /// - SDK computes the required cbBTC input via `SwapMode::ExactOut`;
-    /// - LiteSVM simulates the on-chain `swap` with `is_base_input = false`;
-    /// - We compare the required cbBTC input between SDK math and LiteSVM.
-    #[cfg(feature = "with-litesvm")]
     #[test]
-    #[ignore]
-    fn test_litesvm_vs_sdk_byreal_jup_usdc_exact_out() {
-        use litesvm::LiteSVM;
-        use solana_account::Account as RawAccount;
-        use solana_client::rpc_request::TokenAccountsFilter;
-        use solana_clock::Clock as RawClock;
-        use solana_instruction::{
-            account_meta::AccountMeta as RawAccountMeta, Instruction as RawInstruction,
-        };
-        use solana_message::Message as RawMessage;
-        use solana_pubkey::Pubkey as RawPubkey;
-        use solana_transaction::Transaction as RawTransaction;
+    fn test_pyth_price_feed_address_uses_push_oracle_program() {
+        let jup_feed_id =
+            hex_feed_id("0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996");
+        let usdc_feed_id =
+            hex_feed_id("eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a");
 
-        // 1. Build SDK AMM from mainnet snapshot
-        let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
-        let pool_address =
-            Pubkey::from_str("A5vkCw1VXPNXq5VFbffPm6Bo4kVKAP1UUoRrEn3gyVey").unwrap();
-        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
-
-        let account = rpc.get_account(&pool_address).unwrap();
-        let keyed_account = KeyedAccount {
-            key: pool_address,
-            account: account.into(),
-            params: None,
-        };
-        let amm_context = AmmContext {
-            clock_ref: ClockRef::default(),
-        };
-        let mut amm = ByrealClmmAmm::from_keyed_account(&keyed_account, &amm_context).unwrap();
-
-        // Pull all relevant accounts (pool, vaults, config, observation, bitmap, tick arrays).
-        let accounts_to_update = amm.get_accounts_to_update();
-        let accounts = rpc.get_multiple_accounts(&accounts_to_update).unwrap();
-        let mut account_map: AccountMap = accounts_to_update
-            .iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                accounts[i]
-                    .as_ref()
-                    .map(|account| (*key, account.clone().into()))
-            })
-            .collect();
-        amm.update(&account_map).unwrap();
-
-        // Derive cbBTC mint from pool state (the non-USDC side) and sanity-check
-        // against the expected cbBTC mint used by the aggregator.
-        let expected_cb_btc_mint =
-            Pubkey::from_str("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij").unwrap();
-        let cb_btc_mint = if amm.pool_state.token_mint_0 == usdc_mint {
-            amm.pool_state.token_mint_1
-        } else if amm.pool_state.token_mint_1 == usdc_mint {
-            amm.pool_state.token_mint_0
-        } else {
-            panic!(
-                "Pool {} is not a USDC-cbBTC pool (mints: {}, {})",
-                pool_address, amm.pool_state.token_mint_0, amm.pool_state.token_mint_1
-            );
-        };
         assert_eq!(
-            cb_btc_mint, expected_cb_btc_mint,
-            "Pool {} cbBTC mint mismatch (pool side vs expected)",
-            pool_address
+            get_price_feed_account_address(PYTH_PRICE_SHARD_ID, &jup_feed_id),
+            solana_sdk::pubkey!("7dbob1psH1iZBS7qPsm3Kwbf5DzSXK8Jyg31CTgTnxH5")
+        );
+        assert_eq!(
+            get_price_feed_account_address(PYTH_PRICE_SHARD_ID, &usdc_feed_id),
+            solana_sdk::pubkey!("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX")
+        );
+    }
+
+    #[test]
+    fn test_swap_v3_dyn_metas_match_expected_order() {
+        let mut amm = build_dynamic_test_amm();
+        let first_tick_array = amm.amm.get_swap_tick_arrays(true)[0];
+        amm.amm.dynamic_tick_arrays.insert(
+            first_tick_array,
+            DynamicTickArrayState::Fixed(TickArrayState::default()),
         );
 
-        // Enrich tick-array snapshot via bitmap navigation (both directions).
-        let mut full_tick_addrs: HashSet<Pubkey> = HashSet::new();
-        for &dir in &[true, false] {
-            if let Ok((_, mut start)) = amm
-                .pool_state
-                .get_first_initialized_tick_array(&amm.bitmap_extension, dir)
-            {
-                loop {
-                    full_tick_addrs.insert(amm.get_tick_array_address(start));
-                    match amm.pool_state.next_initialized_tick_array_start_index(
-                        &amm.bitmap_extension,
-                        start,
-                        dir,
-                    ) {
-                        Ok(Some(next)) => {
-                            start = next;
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-        for addr in full_tick_addrs.into_iter() {
-            if !account_map.contains_key(&addr) {
-                if let Ok(acc) = rpc.get_account(&addr) {
-                    account_map.insert(addr, acc.into());
-                }
-            }
-        }
-        amm.update(&account_map).unwrap();
+        let jupiter_program = Pubkey::new_unique();
+        let swap_params = SwapParams {
+            source_mint: amm.amm.pool_state.token_mint_0,
+            destination_mint: amm.amm.pool_state.token_mint_1,
+            source_token_account: Pubkey::new_unique(),
+            destination_token_account: Pubkey::new_unique(),
+            token_transfer_authority: Pubkey::new_unique(),
+            quote_mint_to_referrer: None,
+            jupiter_program_id: &jupiter_program,
+            in_amount: 1_000,
+            out_amount: 1,
+            missing_dynamic_accounts_as_default: false,
+            swap_mode: SwapMode::ExactIn,
+        };
 
-        // Log decay-fee configuration for this pool.
-        println!(
-            "Pool decay_fee_flag={}, init_rate={}, decrease_rate={}, interval={}",
-            amm.pool_state.decay_fee_flag,
-            amm.pool_state.decay_fee_init_fee_rate,
-            amm.pool_state.decay_fee_decrease_rate,
-            amm.pool_state.decay_fee_decrease_interval,
-        );
-        println!(
-            "Decay fee enabled={}, on_sell_mint0={}, on_sell_mint1={}",
-            amm.is_decay_fee_enabled(),
-            amm.is_decay_fee_on_sell_mint0(),
-            amm.is_decay_fee_on_sell_mint1(),
-        );
-        println!(
-            "Base trade_fee_rate={}, protocol_fee_rate={}, fund_fee_rate={}",
-            amm.amm_config.trade_fee_rate,
-            amm.amm_config.protocol_fee_rate,
-            amm.amm_config.fund_fee_rate,
+        let metas = amm.build_swap_v3_dyn_account_metas(&swap_params).unwrap();
+        let (token0_pyth_oracle, token1_pyth_oracle) =
+            get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap();
+
+        assert_eq!(metas[0].pubkey, swap_params.token_transfer_authority);
+        assert!(metas[0].is_signer);
+        assert_eq!(metas[5].pubkey, amm.amm.pool_state.token_vault_0);
+        assert_eq!(metas[6].pubkey, amm.amm.pool_state.token_vault_1);
+        assert_eq!(metas[9].pubkey, spl_token_2022::ID);
+        assert_eq!(metas[10].pubkey, anchor_spl::memo::ID);
+        assert_eq!(metas[11].pubkey, amm.amm.pool_state.token_mint_0);
+        assert_eq!(metas[12].pubkey, amm.amm.pool_state.token_mint_1);
+        assert_eq!(metas[13].pubkey, TickArrayBitmapExtension::key(amm.key));
+        assert!(!metas[13].is_writable);
+        assert_eq!(metas[14].pubkey, first_tick_array);
+        assert!(metas[14].is_writable);
+        assert_eq!(metas[metas.len() - 2].pubkey, token0_pyth_oracle);
+        assert_eq!(metas[metas.len() - 1].pubkey, token1_pyth_oracle);
+        assert!(!metas[metas.len() - 2].is_writable);
+        assert!(!metas[metas.len() - 1].is_writable);
+    }
+
+    #[test]
+    fn test_swap_v3_dyn_metas_reverse_vault_and_mint_order() {
+        let mut amm = build_dynamic_test_amm();
+        let first_tick_array = amm.amm.get_swap_tick_arrays(false)[0];
+        amm.amm.dynamic_tick_arrays.insert(
+            first_tick_array,
+            DynamicTickArrayState::Fixed(TickArrayState::default()),
         );
 
-        // CLMM-owned accounts and their discriminators (for debugging).
-        println!(
-            "TickArrayState discriminator (SDK): {:?}",
-            TickArrayState::DISCRIMINATOR
-        );
-        println!(
-            "DynTickArrayState discriminator (SDK): {:?}",
-            DynTickArrayState::DISCRIMINATOR
-        );
-        for (addr, acc) in account_map.iter() {
-            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
-                continue;
-            }
-            let disc = &acc.data[0..8];
-            let kind = if disc == TickArrayState::DISCRIMINATOR {
-                "fixed_tick_array"
-            } else if disc == DynTickArrayState::DISCRIMINATOR {
-                "dyn_tick_array"
-            } else {
-                "other_clmm_account"
-            };
-            println!("CLMM account {} kind={} disc_bytes={:?}", addr, kind, disc);
-        }
+        let jupiter_program = Pubkey::new_unique();
+        let swap_params = SwapParams {
+            source_mint: amm.amm.pool_state.token_mint_1,
+            destination_mint: amm.amm.pool_state.token_mint_0,
+            source_token_account: Pubkey::new_unique(),
+            destination_token_account: Pubkey::new_unique(),
+            token_transfer_authority: Pubkey::new_unique(),
+            quote_mint_to_referrer: None,
+            jupiter_program_id: &jupiter_program,
+            in_amount: 1_000,
+            out_amount: 1,
+            missing_dynamic_accounts_as_default: false,
+            swap_mode: SwapMode::ExactIn,
+        };
 
-        // Discover user's cbBTC/USDC token accounts (reuse the same authority as the ExactIn test).
-        let user = Pubkey::from_str("DdZR6zRFiUt4S5mg7AV1uKB2z1f1WzcNYCaTEEWPAuby").unwrap();
-        let cb_btc_accounts = rpc
-            .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(cb_btc_mint))
+        let metas = amm.build_swap_v3_dyn_account_metas(&swap_params).unwrap();
+
+        assert_eq!(metas[5].pubkey, amm.amm.pool_state.token_vault_1);
+        assert_eq!(metas[6].pubkey, amm.amm.pool_state.token_vault_0);
+        assert_eq!(metas[11].pubkey, amm.amm.pool_state.token_mint_1);
+        assert_eq!(metas[12].pubkey, amm.amm.pool_state.token_mint_0);
+        assert_eq!(metas[14].pubkey, first_tick_array);
+    }
+
+    #[test]
+    fn test_swap_v3_dyn_metas_reject_missing_directional_first_tick_array() {
+        let amm = build_dynamic_test_amm();
+        let jupiter_program = Pubkey::new_unique();
+        let swap_params = SwapParams {
+            source_mint: amm.amm.pool_state.token_mint_0,
+            destination_mint: amm.amm.pool_state.token_mint_1,
+            source_token_account: Pubkey::new_unique(),
+            destination_token_account: Pubkey::new_unique(),
+            token_transfer_authority: Pubkey::new_unique(),
+            quote_mint_to_referrer: None,
+            jupiter_program_id: &jupiter_program,
+            in_amount: 1_000,
+            out_amount: 1,
+            missing_dynamic_accounts_as_default: false,
+            swap_mode: SwapMode::ExactIn,
+        };
+
+        let err = amm.build_swap_v3_dyn_account_metas(&swap_params).unwrap_err();
+        assert!(format!("{err:#}")
+            .contains("directional first tick array account missing for dynamic swap"));
+    }
+
+    #[cfg(feature = "dynamic-pool")]
+    #[test]
+    fn test_dynamic_pool_feature_on_returns_quote_and_swap_v3_dyn_route() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.sqrt_price_x64 =
+            byreal_clmm_common::tick_math::get_sqrt_price_at_tick(0).unwrap();
+        amm.amm.pool_state.tick_current = 0;
+        amm.amm.pool_state.tick_spacing = 1;
+        amm.amm.pool_state.liquidity = 1_000_000_000;
+        amm.amm.pool_state.mint_decimals_0 = 6;
+        amm.amm.pool_state.mint_decimals_1 = 6;
+        amm.amm.pool_state.set_quote_token_flag(true);
+        amm.amm.pool_state.open_time = 0;
+        amm.amm.pool_state.arbitrage_fee_buffer_ppm = 10_000;
+        amm.amm.pool_state.trade_slippage_fee_base = 50;
+        amm.amm.pool_state.trade_slippage_fee_trade_size_threshold = 1;
+        amm.amm.pool_state.imbalance_fee_base = 20;
+        amm.amm.pool_state.imbalance_fee_x = 50;
+        amm.amm.amm_config.trade_fee_rate = 1_200;
+        amm.amm.token0_vault_amount = 5_000_000_000;
+        amm.amm.token1_vault_amount = 500_000_000;
+        amm.amm.token0_pyth_price = Some(Price {
+            price: 100_000_000,
+            conf: 1,
+            exponent: -8,
+            publish_time: 100,
+        });
+        amm.amm.token1_pyth_price = Some(Price {
+            price: 1_000_000,
+            conf: 1,
+            exponent: -6,
+            publish_time: 100,
+        });
+        amm.timestamp.store(200, std::sync::atomic::Ordering::Relaxed);
+
+        let current_start = 0;
+        amm.amm
+            .pool_state
+            .flip_tick_array_bit_internal(current_start)
             .unwrap();
-        let usdc_accounts = rpc
-            .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(usdc_mint))
-            .unwrap();
-        if cb_btc_accounts.is_empty() || usdc_accounts.is_empty() {
-            println!(
-                "User {} missing cbBTC or USDC ATA; skipping ExactOut LiteSVM test.",
-                user
-            );
-            return;
-        }
-        let cb_btc_ata = Pubkey::from_str(&cb_btc_accounts[0].pubkey).unwrap();
-        let usdc_ata = Pubkey::from_str(&usdc_accounts[0].pubkey).unwrap();
+        let mut tick_array = TickArrayState::default();
+        tick_array.pool_id = amm.key;
+        tick_array.start_tick_index = current_start;
+        tick_array.ticks[1].tick = 1;
+        tick_array.ticks[1].liquidity_gross = 1;
+        tick_array.initialized_tick_count = 1;
+        let current_tick_array = amm.amm.get_tick_array_address(current_start);
+        amm.amm.dynamic_tick_arrays.insert(
+            current_tick_array,
+            DynamicTickArrayState::Fixed(tick_array),
+        );
 
-        // Desired exact-out amount: 2000 USDC (6 decimals).
-        let desired_out: u64 = 2_000_000_000;
-
-        // SDK quote baseline: cbBTC -> USDC (ExactOut)
-        let sdk_quote = amm
+        let quote = amm
             .quote(&QuoteParams {
-                amount: desired_out,
-                input_mint: cb_btc_mint,
-                output_mint: usdc_mint,
-                swap_mode: SwapMode::ExactOut,
+                amount: 1_000,
+                input_mint: amm.amm.pool_state.token_mint_1,
+                output_mint: amm.amm.pool_state.token_mint_0,
+                swap_mode: SwapMode::ExactIn,
             })
             .unwrap();
-        println!(
-            "SDK exact-out quote: in={} (cbBTC), out={} (USDC), fee={}",
-            sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+        assert_eq!(quote.in_amount, 1_000);
+        assert!(quote.out_amount > 0);
+        assert!(quote.fee_amount > 0);
+
+        let jupiter_program = Pubkey::new_unique();
+        let swap = amm
+            .get_swap_and_account_metas(&SwapParams {
+                source_mint: amm.amm.pool_state.token_mint_1,
+                destination_mint: amm.amm.pool_state.token_mint_0,
+                source_token_account: Pubkey::new_unique(),
+                destination_token_account: Pubkey::new_unique(),
+                token_transfer_authority: Pubkey::new_unique(),
+                quote_mint_to_referrer: None,
+                jupiter_program_id: &jupiter_program,
+                in_amount: quote.in_amount,
+                out_amount: quote.out_amount,
+                missing_dynamic_accounts_as_default: false,
+                swap_mode: SwapMode::ExactIn,
+            })
+            .unwrap();
+        assert_eq!(swap.swap, Swap::RaydiumClmmV2);
+        assert_eq!(swap.account_metas[14].pubkey, current_tick_array);
+        let (token0_pyth_oracle, token1_pyth_oracle) =
+            get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap();
+        assert_eq!(swap.account_metas[swap.account_metas.len() - 2].pubkey, token0_pyth_oracle);
+        assert_eq!(swap.account_metas[swap.account_metas.len() - 1].pubkey, token1_pyth_oracle);
+    }
+
+    #[test]
+    fn test_decode_vault_amount_supports_spl_and_token_2022() {
+        let mut spl_vault = spl_token::state::Account::default();
+        spl_vault.state = spl_token::state::AccountState::Initialized;
+        spl_vault.amount = 123_456;
+        let mut spl_bytes = vec![0u8; spl_token::state::Account::LEN];
+        spl_token::state::Account::pack(spl_vault, &mut spl_bytes).unwrap();
+        assert_eq!(
+            decode_vault_amount(&spl_token::id(), &spl_bytes).unwrap(),
+            123_456
         );
 
-        // 2. Build LiteSVM VM and load Byreal CLMM BPF program
-        let mut svm = LiteSVM::new()
-            .with_sysvars()
-            .with_builtins()
-            .with_default_programs()
-            .with_sigverify(false)
-            .with_blockhash_check(false);
-
-        let program_bytes = include_bytes!("./byreal_clmm.so");
-        let clmm_program = RawPubkey::new_from_array(BYREAL_CLMM_PROGRAM.to_bytes());
-        svm.add_program(clmm_program, program_bytes).unwrap();
-
-        // 3. Write pool/tick/aux accounts into LiteSVM
-        for (addr, acc) in account_map.iter() {
-            let raw_addr = RawPubkey::new_from_array(addr.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: acc.data.clone(),
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-
-        // Also write user cbBTC/USDC token accounts. For cbBTC ATA, ensure the
-        // simulated balance is sufficient to cover the SDK-computed required
-        // input amount, so that we do not fail with "insufficient funds" while
-        // validating the math.
-        {
-            // cbBTC ATA with topped-up balance in the LiteSVM VM
-            let acc = rpc.get_account(&cb_btc_ata).unwrap();
-            let mut cbbtc_data = acc.data.clone();
-            if let Ok(mut token_acc) =
-                anchor_spl::token::spl_token::state::Account::unpack(&cbbtc_data)
-            {
-                if token_acc.amount < sdk_quote.in_amount {
-                    token_acc.amount = sdk_quote.in_amount.saturating_mul(2);
-                    let mut new_data = vec![0u8; cbbtc_data.len()];
-                    anchor_spl::token::spl_token::state::Account::pack(token_acc, &mut new_data)
-                        .unwrap();
-                    cbbtc_data = new_data;
-                }
-            }
-            let raw_addr = RawPubkey::new_from_array(cb_btc_ata.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: cbbtc_data,
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-        {
-            // USDC ATA unchanged
-            let acc = rpc.get_account(&usdc_ata).unwrap();
-            let raw_addr = RawPubkey::new_from_array(usdc_ata.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: acc.data,
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-
-        // Ensure user lamport account exists in LiteSVM via airdrop
-        let user_raw = RawPubkey::new_from_array(user.to_bytes());
-        svm.airdrop(&user_raw, 1_000_000_000).unwrap();
-
-        // Align LiteSVM clock so that swap pool is considered "open".
-        let mut clock_sysvar: RawClock = svm.get_sysvar();
-        clock_sysvar.unix_timestamp = (amm.pool_state.open_time as i64).saturating_add(1);
-        svm.set_sysvar(&clock_sysvar);
-
-        // 4. Construct swap instruction accounts + data (ExactOut).
-        let zero_for_one = cb_btc_mint == amm.pool_state.token_mint_0;
-        let (input_vault, output_vault) = if zero_for_one {
-            (amm.pool_state.token_vault_0, amm.pool_state.token_vault_1)
-        } else {
-            (amm.pool_state.token_vault_1, amm.pool_state.token_vault_0)
-        };
-
-        // Ordered tick arrays in swap direction.
-        let mut all_tick_arrays: Vec<Pubkey> = Vec::new();
-        for (addr, acc) in account_map.iter() {
-            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
-                continue;
-            }
-            let disc = &acc.data[0..8];
-            if disc == DynTickArrayState::DISCRIMINATOR || disc == TickArrayState::DISCRIMINATOR {
-                all_tick_arrays.push(*addr);
-            }
-        }
-        if all_tick_arrays.is_empty() {
-            panic!("No tick array accounts with valid discriminator found in snapshot");
-        }
-
-        let mut ordered_tick_arrays: Vec<Pubkey> = Vec::new();
-        if let Ok((_, mut start)) = amm
-            .pool_state
-            .get_first_initialized_tick_array(&amm.bitmap_extension, zero_for_one)
-        {
-            loop {
-                let addr = amm.get_tick_array_address(start);
-                if account_map.contains_key(&addr) {
-                    ordered_tick_arrays.push(addr);
-                }
-                match amm.pool_state.next_initialized_tick_array_start_index(
-                    &amm.bitmap_extension,
-                    start,
-                    zero_for_one,
-                ) {
-                    Ok(Some(next)) => {
-                        start = next;
-                    }
-                    _ => break,
-                }
-            }
-        }
-        if ordered_tick_arrays.is_empty() {
-            ordered_tick_arrays.extend(all_tick_arrays.iter().copied());
-        }
-        if ordered_tick_arrays.is_empty() {
-            panic!("No ordered tick array accounts available for swap");
-        }
-        println!("Selected tick_array candidates (ordered_tick_arrays):");
-        for addr in ordered_tick_arrays.iter() {
-            if let Some(acc) = account_map.get(addr) {
-                let disc = if acc.data.len() >= 8 {
-                    Some(&acc.data[0..8])
-                } else {
-                    None
-                };
-                println!("- {} disc_bytes={:?}", addr, disc);
-            }
-        }
-
-        #[derive(anchor_lang::AnchorSerialize, anchor_lang::AnchorDeserialize)]
-        struct SwapIxArgs {
-            amount: u64,
-            other_amount_threshold: u64,
-            sqrt_price_limit_x64: u128,
-            is_base_input: bool,
-        }
-
-        // Use ExactOut semantics: amount = desired USDC out, is_base_input = false.
-        // Set other_amount_threshold to sdk_quote.in_amount so that the on-chain
-        // slippage check matches the SDK's computed min input.
-        let mut data = vec![248u8, 198, 158, 145, 225, 117, 135, 200];
-        data.extend(
-            SwapIxArgs {
-                amount: desired_out,
-                other_amount_threshold: sdk_quote.in_amount,
-                sqrt_price_limit_x64: 0,
-                is_base_input: false,
-            }
-            .try_to_vec()
-            .unwrap(),
+        let mut token2022_vault = Token2022Account::default();
+        token2022_vault.state = spl_token_2022::state::AccountState::Initialized;
+        token2022_vault.amount = 654_321;
+        let mut token2022_bytes = vec![0u8; Token2022Account::LEN];
+        Token2022Account::pack(token2022_vault, &mut token2022_bytes).unwrap();
+        assert_eq!(
+            decode_vault_amount(&spl_token_2022::id(), &token2022_bytes).unwrap(),
+            654_321
         );
 
-        // Accounts: payer, amm_config, pool_state, input/output token accounts,
-        // vaults, observation, token_program, primary tick_array, bitmap extension, remaining arrays.
-        let mut accounts: Vec<RawAccountMeta> = Vec::new();
+        let err = decode_vault_amount(&Pubkey::new_unique(), &spl_bytes).unwrap_err();
+        assert!(format!("{err:#}").contains("unsupported token vault owner"));
+    }
 
-        // payer
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(user.to_bytes()),
-            is_signer: true,
-            is_writable: false,
-        });
-        // amm_config
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.pool_state.amm_config.to_bytes()),
-            is_signer: false,
-            is_writable: false,
-        });
-        // pool_state
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.key.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // input/output user token accounts (cbBTC -> USDC)
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(cb_btc_ata.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(usdc_ata.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // input / output vaults
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(input_vault.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(output_vault.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // observation_state
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.pool_state.observation_key.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // token_program
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(anchor_spl::token::ID.to_bytes()),
-            is_signer: false,
-            is_writable: false,
-        });
-
-        // primary tick_array
-        let primary_tick_array = ordered_tick_arrays[0];
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(primary_tick_array.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-
-        // bitmap extension + remaining tick arrays
-        let bitmap_key = TickArrayBitmapExtension::key(amm.key);
-        if account_map.contains_key(&bitmap_key) {
-            accounts.push(RawAccountMeta {
-                pubkey: RawPubkey::new_from_array(bitmap_key.to_bytes()),
-                is_signer: false,
-                is_writable: false,
-            });
+    fn hex_feed_id(value: &str) -> [u8; 32] {
+        let mut feed_id = [0u8; 32];
+        for i in 0..32 {
+            feed_id[i] = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).unwrap();
         }
-        for addr in ordered_tick_arrays.iter().skip(1) {
-            accounts.push(RawAccountMeta {
-                pubkey: RawPubkey::new_from_array(addr.to_bytes()),
-                is_signer: false,
-                is_writable: true,
-            });
-        }
-
-        let raw_ix = RawInstruction {
-            program_id: clmm_program,
-            accounts,
-            data,
-        };
-
-        let msg = RawMessage::new(&[raw_ix], Some(&user_raw));
-        let tx = RawTransaction::new_unsigned(msg);
-
-        // 5. Simulate transaction in LiteSVM
-        let sim = svm
-            .simulate_transaction(tx)
-            .expect("LiteSVM simulate_transaction (ExactOut) should succeed");
-
-        #[cfg(feature = "debug-swap-steps")]
-        println!("LiteSVM exact-out logs: {:?}", sim.meta.logs);
-
-        // Compute cbBTC input from pre/post cbBTC ATA.
-        let cb_btc_raw = RawPubkey::new_from_array(cb_btc_ata.to_bytes());
-        let mut post_cb_btc_amount: Option<u64> = None;
-        for (pk, acc) in sim.post_accounts.iter() {
-            if *pk == cb_btc_raw {
-                let raw: RawAccount = (*acc).clone().into();
-                if let Ok(token_acc) =
-                    anchor_spl::token::spl_token::state::Account::unpack(&raw.data)
-                {
-                    post_cb_btc_amount = Some(token_acc.amount);
-                }
-            }
-        }
-        if post_cb_btc_amount.is_none() {
-            println!(
-                "LiteSVM (ExactOut) did not modify cbBTC ATA; logs: {:?}",
-                sim.meta.logs
-            );
-            return;
-        }
-
-        let pre_cb_btc_acc = rpc.get_account(&cb_btc_ata).unwrap();
-        let pre_cb_btc_token =
-            anchor_spl::token::spl_token::state::Account::unpack(&pre_cb_btc_acc.data).unwrap();
-        let pre_in = pre_cb_btc_token.amount;
-        let post_in = post_cb_btc_amount.unwrap();
-        let litesvm_in = pre_in.saturating_sub(post_in);
-
-        println!(
-            "LiteSVM ExactOut in_cbBTC={}, diff (sdk_in - litesvm_in)={}",
-            litesvm_in,
-            sdk_quote.in_amount.saturating_sub(litesvm_in)
-        );
+        feed_id
     }
 }
