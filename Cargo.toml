@@ -1,6 +1,10 @@
 [workspace]
-members = ["byreal-clmm-jupiter-integration", "byreal-clmm-common"]
+members = ["byreal-clmm-common"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
+
+[patch.crates-io]
+pyth-sdk = { git = "https://github.com/jup-ag/pyth-sdk-rs.git", rev = "e50aec5375e9b064c6b91f7dfd8c9a3061fd9c16" }
+pyth-sdk-solana = { git = "https://github.com/jup-ag/pyth-sdk-rs.git", rev = "e50aec5375e9b064c6b91f7dfd8c9a3061fd9c16" }

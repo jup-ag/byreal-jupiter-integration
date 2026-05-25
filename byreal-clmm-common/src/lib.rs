@@ -1,34 +1,41 @@
 use anchor_lang::prelude::*;
 use anyhow::{anyhow, Result};
-use solana_pubkey::Pubkey;
+use pyth_solana_receiver_sdk::price_update::Price;
+use solana_address::{address, Address};
+use spl_token_2022_interface::extension::transfer_fee::{TransferFeeConfig, MAX_FEE_BASIS_POINTS};
 use std::collections::HashMap;
 
-use byreal_clmm::libraries::MulDiv;
+use byreal_clmm::libraries::{
+    dynamic_fee_math::{
+        calculate_dynamic_fee_rate, normalize_trade_size, price_from_sqrt_price_x64,
+        quote_amount_from_base, DynamicFeeInputs,
+    },
+    MulDiv,
+};
 use byreal_clmm::states::TICK_ARRAY_SEED;
+use byreal_clmm::util::pyth::calculate_price_index;
 pub use byreal_clmm::{
     libraries::{liquidity_math, swap_math, tick_math, MAX_SQRT_PRICE_X64, MIN_SQRT_PRICE_X64},
     states::{
-        AmmConfig, DynTickArrayState, PoolState, TickArrayBitmapExtension, TickArrayState,
-        TickState, TickUtils,
+        AmmConfig, DynTickArrayState, PoolState, PoolStatusBitIndex, TickArrayBitmapExtension,
+        TickArrayState, TickState, TickUtils,
     },
 };
 use std::collections::BTreeSet;
 
 // Program IDs
 #[cfg(feature = "mainnet")]
-pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_pubkey::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
+pub const BYREAL_CLMM_PROGRAM: Address = address!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 #[cfg(feature = "devnet")]
-pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_pubkey::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
+pub const BYREAL_CLMM_PROGRAM: Address = address!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
 
 #[cfg(not(any(feature = "mainnet", feature = "devnet")))]
-pub const BYREAL_CLMM_PROGRAM: Pubkey =
-    solana_pubkey::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
+pub const BYREAL_CLMM_PROGRAM: Address = address!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 // Constants
 pub const TICK_ARRAY_SIZE: i32 = 60;
+const DYNAMIC_MAX_PYTH_AGE_SECONDS: i64 = 3600;
 
 #[derive(Clone)]
 pub enum DynamicTickArrayState {
@@ -169,6 +176,12 @@ pub struct ByrealClmmAmm {
     pub tick_array_pda_cache: HashMap<i32, Pubkey>,
     /// Cached list of tick array addresses gathered during the last update
     pub cached_tick_array_addresses: Vec<Pubkey>,
+    pub token0_vault_amount: u64,
+    pub token1_vault_amount: u64,
+    pub token0_pyth_price: Option<Price>,
+    pub token1_pyth_price: Option<Price>,
+    pub token0_transfer_fee_config: Option<TransferFeeConfig>,
+    pub token1_transfer_fee_config: Option<TransferFeeConfig>,
 }
 
 impl ByrealClmmAmm {
@@ -318,16 +331,14 @@ impl ByrealClmmAmm {
             collect_dir(false, self.max_one_side_tick_arrays);
         }
 
-        // Fallback to naive neighbors if nothing collected
-        if start_indexes.is_empty() {
-            let tick_spacing = self.pool_state.tick_spacing;
-            let current_tick = self.pool_state.tick_current;
-            let current_start_index = TickUtils::get_array_start_index(current_tick, tick_spacing);
-            start_indexes.insert(current_start_index);
-            for i in 1..self.max_one_side_tick_arrays {
-                let offset = (TICK_ARRAY_SIZE * i as i32) * i32::from(tick_spacing);
-                start_indexes.insert(current_start_index.saturating_sub(offset));
-            }
+        let tick_spacing = self.pool_state.tick_spacing;
+        let current_tick = self.pool_state.tick_current;
+        let current_start_index = TickUtils::get_array_start_index(current_tick, tick_spacing);
+        start_indexes.insert(current_start_index);
+        for i in 1..self.max_one_side_tick_arrays {
+            let offset = (TICK_ARRAY_SIZE * i as i32) * i32::from(tick_spacing);
+            start_indexes.insert(current_start_index.saturating_sub(offset));
+            start_indexes.insert(current_start_index.saturating_add(offset));
         }
 
         start_indexes
@@ -460,6 +471,167 @@ impl ByrealClmmAmm {
         Some(rate as u32)
     }
 
+    fn load_dynamic_pyth_prices(&self, current_timestamp: i64) -> Result<(Price, Price)> {
+        let token0_price = *self
+            .token0_pyth_price
+            .as_ref()
+            .ok_or_else(|| anyhow!("dynamic fee token0 pyth price missing"))?;
+        let token1_price = *self
+            .token1_pyth_price
+            .as_ref()
+            .ok_or_else(|| anyhow!("dynamic fee token1 pyth price missing"))?;
+
+        if token0_price.price <= 0 || token1_price.price <= 0 {
+            return Err(anyhow!("dynamic fee pyth price is non-positive"));
+        }
+
+        let oldest_allowed = current_timestamp - DYNAMIC_MAX_PYTH_AGE_SECONDS;
+        if token0_price.publish_time < oldest_allowed || token1_price.publish_time < oldest_allowed
+        {
+            return Err(anyhow!("dynamic fee pyth price is stale"));
+        }
+
+        Ok((token0_price, token1_price))
+    }
+
+    fn calculate_transfer_fee(
+        config: Option<&TransferFeeConfig>,
+        epoch: u64,
+        pre_fee_amount: u64,
+    ) -> Result<u64> {
+        match config {
+            Some(config) => config
+                .calculate_epoch_fee(epoch, pre_fee_amount)
+                .ok_or_else(|| anyhow!("transfer fee calculation overflow")),
+            None => Ok(0),
+        }
+    }
+
+    fn calculate_transfer_inverse_fee(
+        config: Option<&TransferFeeConfig>,
+        epoch: u64,
+        post_fee_amount: u64,
+    ) -> Result<u64> {
+        let config = match config {
+            Some(config) => config,
+            None => return Ok(0),
+        };
+
+        let transfer_fee = config.get_epoch_fee(epoch);
+        if u16::from(transfer_fee.transfer_fee_basis_points) == MAX_FEE_BASIS_POINTS {
+            return Ok(u64::from(transfer_fee.maximum_fee));
+        }
+
+        let fee = config
+            .calculate_inverse_epoch_fee(epoch, post_fee_amount)
+            .ok_or_else(|| anyhow!("transfer inverse fee calculation overflow"))?;
+        let check_fee = config
+            .calculate_epoch_fee(
+                epoch,
+                post_fee_amount
+                    .checked_add(fee)
+                    .ok_or_else(|| anyhow!("transfer fee gross amount overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("transfer inverse fee verification overflow"))?;
+        if fee != check_fee {
+            return Err(anyhow!("transfer fee calculate not match"));
+        }
+        Ok(fee)
+    }
+
+    fn compute_trade_fee_rate(
+        &self,
+        zero_for_one: bool,
+        amount_specified: u64,
+        is_base_input: bool,
+        current_timestamp: i64,
+    ) -> Result<u32> {
+        let fee_rate = self
+            .pool_state
+            .calculate_base_trade_fee_rate(&self.amm_config, zero_for_one, current_timestamp as u64)
+            .map_err(|e| anyhow!("base trade fee computation failed: {e}"))?;
+
+        if !self.pool_state.is_swap_dynamic_fee_enabled() {
+            return Ok(fee_rate);
+        }
+
+        let (token0_price, token1_price) = self.load_dynamic_pyth_prices(current_timestamp)?;
+        let p_index = calculate_price_index(
+            &token0_price,
+            &token1_price,
+            self.pool_state.mint_decimals_0,
+            self.pool_state.mint_decimals_1,
+        )?;
+        let p_0 = price_from_sqrt_price_x64(self.pool_state.sqrt_price_x64)?;
+
+        let token1_as_quote = self.pool_state.is_token1_quote();
+        let input_is_quote = if token1_as_quote {
+            !zero_for_one
+        } else {
+            zero_for_one
+        };
+        let is_buying_base = input_is_quote;
+
+        let quote_amount = if is_base_input {
+            if input_is_quote {
+                amount_specified as u128
+            } else {
+                quote_amount_from_base(amount_specified as u128, p_0, token1_as_quote)?
+            }
+        } else {
+            let output_is_quote = !input_is_quote;
+            if output_is_quote {
+                amount_specified as u128
+            } else {
+                quote_amount_from_base(amount_specified as u128, p_0, token1_as_quote)?
+            }
+        };
+
+        let quote_decimals = if token1_as_quote {
+            self.pool_state.mint_decimals_1
+        } else {
+            self.pool_state.mint_decimals_0
+        };
+        let trade_size = normalize_trade_size(quote_amount, quote_decimals)?;
+
+        let token0_vault_amount = self.token0_vault_amount as u128;
+        let token1_vault_amount = self.token1_vault_amount as u128;
+        let (quote_value_of_base, quote_balance) = if token1_as_quote {
+            let base_amount = token0_vault_amount;
+            let quote_balance = token1_vault_amount;
+            (
+                quote_amount_from_base(base_amount, p_0, true)?,
+                quote_balance,
+            )
+        } else {
+            let base_amount = token1_vault_amount;
+            let quote_balance = token0_vault_amount;
+            (
+                quote_amount_from_base(base_amount, p_0, false)?,
+                quote_balance,
+            )
+        };
+
+        let dynamic = calculate_dynamic_fee_rate(&DynamicFeeInputs {
+            p_0,
+            p_index,
+            trade_size,
+            quote_value_of_base,
+            quote_balance,
+            is_buying_base,
+            fee_base: fee_rate,
+            arbitrage_fee_buffer_ppm: self.pool_state.arbitrage_fee_buffer_ppm,
+            trade_slippage_fee_base: self.pool_state.trade_slippage_fee_base,
+            trade_slippage_fee_trade_size_threshold: self
+                .pool_state
+                .trade_slippage_fee_trade_size_threshold,
+            imbalance_fee_base: self.pool_state.imbalance_fee_base,
+            imbalance_fee_x: self.pool_state.imbalance_fee_x,
+        })?;
+
+        Ok(dynamic.total_fee_rate)
+    }
+
     /// Compute swap for the given parameters
     pub fn compute_swap(
         &self,
@@ -468,7 +640,21 @@ impl ByrealClmmAmm {
         is_base_input: bool,
         sqrt_price_limit_x64: Option<u128>,
         current_timestamp: i64,
+        current_epoch: u64,
     ) -> Result<SwapResult> {
+        if amount_specified == 0 {
+            return Err(anyhow!("zero amount specified"));
+        }
+        if current_timestamp < 0 {
+            return Err(anyhow!("invalid negative timestamp"));
+        }
+        if current_timestamp as u64 <= self.pool_state.open_time {
+            return Err(anyhow!("Pool is not open yet"));
+        }
+        if !self.pool_state.get_status_by_bit(PoolStatusBitIndex::Swap) {
+            return Err(anyhow!("Pool swap is not approved"));
+        }
+
         let sqrt_price_limit = sqrt_price_limit_x64.unwrap_or_else(|| {
             if zero_for_one {
                 MIN_SQRT_PRICE_X64 + 1
@@ -477,9 +663,47 @@ impl ByrealClmmAmm {
             }
         });
 
+        let (input_transfer_config, output_transfer_config) = if zero_for_one {
+            (
+                self.token0_transfer_fee_config.as_ref(),
+                self.token1_transfer_fee_config.as_ref(),
+            )
+        } else {
+            (
+                self.token1_transfer_fee_config.as_ref(),
+                self.token0_transfer_fee_config.as_ref(),
+            )
+        };
+
+        let (amount_calculate_specified, specified_transfer_fee) = if is_base_input {
+            let transfer_fee = Self::calculate_transfer_fee(
+                input_transfer_config,
+                current_epoch,
+                amount_specified,
+            )?;
+            (
+                amount_specified
+                    .checked_sub(transfer_fee)
+                    .ok_or_else(|| anyhow!("transfer fee exceeds specified amount"))?,
+                transfer_fee,
+            )
+        } else {
+            let transfer_fee = Self::calculate_transfer_inverse_fee(
+                output_transfer_config,
+                current_epoch,
+                amount_specified,
+            )?;
+            (
+                amount_specified
+                    .checked_add(transfer_fee)
+                    .ok_or_else(|| anyhow!("transfer fee adjusted amount overflow"))?,
+                transfer_fee,
+            )
+        };
+
         // Initialize swap state
         let mut state = SwapState {
-            amount_specified_remaining: amount_specified,
+            amount_specified_remaining: amount_calculate_specified,
             amount_calculated: 0,
             sqrt_price_x64: self.pool_state.sqrt_price_x64,
             tick: self.pool_state.tick_current,
@@ -487,23 +711,12 @@ impl ByrealClmmAmm {
             fee_amount: 0,
         };
 
-        // Calculate fee rate considering decay fee
-        let mut fee_rate = self.amm_config.trade_fee_rate;
-
-        if self.is_decay_fee_enabled() {
-            if let Some(decay_fee_rate) = if zero_for_one && self.is_decay_fee_on_sell_mint0() {
-                self.get_decay_fee_rate(current_timestamp as u64)
-            } else if !zero_for_one && self.is_decay_fee_on_sell_mint1() {
-                self.get_decay_fee_rate(current_timestamp as u64)
-            } else {
-                None
-            } {
-                // Use decay fee if it's higher than the base fee
-                if decay_fee_rate > fee_rate {
-                    fee_rate = decay_fee_rate;
-                }
-            }
-        }
+        let fee_rate = self.compute_trade_fee_rate(
+            zero_for_one,
+            amount_specified,
+            is_base_input,
+            current_timestamp,
+        )?;
 
         // Initialize tick-array navigation state so that tick discovery mirrors
         // the on-chain `swap_internal` helper logic.
@@ -541,12 +754,21 @@ impl ByrealClmmAmm {
 
             // Update state
             state.sqrt_price_x64 = step.sqrt_price_next_x64;
-            state.fee_amount += step.fee_amount;
+            if state.liquidity > 0 {
+                state.fee_amount = state
+                    .fee_amount
+                    .checked_add(step.fee_amount)
+                    .ok_or_else(|| anyhow!("compute_swap: fee_amount overflow"))?;
+            }
 
             if is_base_input {
+                let step_amount_in_with_fee =
+                    step.amount_in.checked_add(step.fee_amount).ok_or_else(|| {
+                        anyhow!("compute_swap: step.amount_in + fee_amount overflow (exact in)")
+                    })?;
                 state.amount_specified_remaining = state
                     .amount_specified_remaining
-                    .checked_sub(step.amount_in + step.fee_amount)
+                    .checked_sub(step_amount_in_with_fee)
                     .ok_or_else(|| {
                         anyhow!(
                             "compute_swap: step.amount_in + fee_amount exceeds remaining (exact in)"
@@ -567,9 +789,13 @@ impl ByrealClmmAmm {
                     .ok_or_else(|| {
                         anyhow!("compute_swap: step.amount_out exceeds remaining (exact out)")
                     })?;
+                let step_amount_in_with_fee =
+                    step.amount_in.checked_add(step.fee_amount).ok_or_else(|| {
+                        anyhow!("compute_swap: step.amount_in + fee_amount overflow (exact out)")
+                    })?;
                 state.amount_calculated = state
                     .amount_calculated
-                    .checked_add(step.amount_in + step.fee_amount)
+                    .checked_add(step_amount_in_with_fee)
                     .ok_or_else(|| {
                         anyhow!(
                             "compute_swap: amount_calculated overflow when adding amount_in + fee (exact out)"
@@ -603,16 +829,72 @@ impl ByrealClmmAmm {
             }
         }
 
+        let raw_amount_in = if is_base_input {
+            amount_calculate_specified
+                .checked_sub(state.amount_specified_remaining)
+                .ok_or_else(|| anyhow!("compute_swap: raw input underflow"))?
+        } else {
+            state.amount_calculated
+        };
+        let raw_amount_out = if is_base_input {
+            state.amount_calculated
+        } else {
+            amount_calculate_specified
+                .checked_sub(state.amount_specified_remaining)
+                .ok_or_else(|| anyhow!("compute_swap: raw output underflow"))?
+        };
+        if raw_amount_in == 0 || raw_amount_out == 0 {
+            return Err(anyhow!(
+                "swap produced zero amount; chain would reject TooSmallInputOrOutputAmount"
+            ));
+        }
+
         Ok(SwapResult {
             amount_in: if is_base_input {
-                amount_specified - state.amount_specified_remaining
+                let transfer_fee = if raw_amount_in == amount_calculate_specified {
+                    specified_transfer_fee
+                } else {
+                    Self::calculate_transfer_inverse_fee(
+                        input_transfer_config,
+                        current_epoch,
+                        raw_amount_in,
+                    )?
+                };
+                raw_amount_in
+                    .checked_add(transfer_fee)
+                    .ok_or_else(|| anyhow!("input amount transfer fee overflow"))?
             } else {
-                state.amount_calculated
+                let transfer_fee = Self::calculate_transfer_inverse_fee(
+                    input_transfer_config,
+                    current_epoch,
+                    raw_amount_in,
+                )?;
+                raw_amount_in
+                    .checked_add(transfer_fee)
+                    .ok_or_else(|| anyhow!("input amount transfer fee overflow"))?
             },
             amount_out: if is_base_input {
-                state.amount_calculated
+                let transfer_fee = Self::calculate_transfer_fee(
+                    output_transfer_config,
+                    current_epoch,
+                    raw_amount_out,
+                )?;
+                raw_amount_out
+                    .checked_sub(transfer_fee)
+                    .ok_or_else(|| anyhow!("output transfer fee exceeds amount"))?
             } else {
-                amount_specified - state.amount_specified_remaining
+                let transfer_fee = if raw_amount_out == amount_calculate_specified {
+                    specified_transfer_fee
+                } else {
+                    Self::calculate_transfer_fee(
+                        output_transfer_config,
+                        current_epoch,
+                        raw_amount_out,
+                    )?
+                };
+                raw_amount_out
+                    .checked_sub(transfer_fee)
+                    .ok_or_else(|| anyhow!("output transfer fee exceeds amount"))?
             },
             fee_amount: state.fee_amount,
             fee_rate,
