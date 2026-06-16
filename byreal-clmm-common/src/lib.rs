@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
-use anyhow::{anyhow, Result};
-use pyth_solana_receiver_sdk::price_update::Price;
+use anyhow::{anyhow, ensure, Result};
+use pyth_solana_receiver_sdk::price_update::{Price, PriceUpdateV2};
+use pyth_solana_receiver_sdk::PYTH_PUSH_ORACLE_ID;
 use solana_address::{address, Address};
 use spl_token_2022_interface::extension::transfer_fee::{TransferFeeConfig, MAX_FEE_BASIS_POINTS};
 use std::collections::HashMap;
@@ -36,6 +37,9 @@ pub const BYREAL_CLMM_PROGRAM: Address = address!("REALQqNEomY6cQGZJUGwywTBD2UmD
 // Constants
 pub const TICK_ARRAY_SIZE: i32 = 60;
 const DYNAMIC_MAX_PYTH_AGE_SECONDS: i64 = 3600;
+/// Shard id used by the on-chain push-oracle program when deriving the
+/// price-feed account address from a Pyth feed id.
+const PYTH_PRICE_SHARD_ID: u16 = 0;
 
 #[derive(Clone)]
 pub enum DynamicTickArrayState {
@@ -502,6 +506,44 @@ pub fn get_decay_fee_rate(pool_state: &PoolState, current_timestamp: u64) -> Opt
     rate = rate.mul_div_ceil(pool_state.decay_fee_init_fee_rate as u64, 100u64)?;
 
     Some(rate as u32)
+}
+
+/// Derive the on-chain price-feed account address for a Pyth feed id, using
+/// the push-oracle program's PDA scheme `(shard_id_le, feed_id) / push_oracle`.
+pub fn pyth_price_feed_address(feed_id: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(
+        &[&PYTH_PRICE_SHARD_ID.to_le_bytes(), feed_id],
+        &PYTH_PUSH_ORACLE_ID,
+    )
+    .0
+}
+
+/// Resolve the (token0, token1) Pyth price-feed account addresses for a
+/// dynamic-fee pool. Errors if either feed id is zero (unconfigured).
+pub fn dynamic_pyth_oracle_addresses(pool_state: &PoolState) -> Result<(Pubkey, Pubkey)> {
+    ensure!(
+        pool_state.token0_pyth_feed_id != [0u8; 32],
+        "dynamic-fee pool token0 pyth feed id is zero"
+    );
+    ensure!(
+        pool_state.token1_pyth_feed_id != [0u8; 32],
+        "dynamic-fee pool token1 pyth feed id is zero"
+    );
+    Ok((
+        pyth_price_feed_address(&pool_state.token0_pyth_feed_id),
+        pyth_price_feed_address(&pool_state.token1_pyth_feed_id),
+    ))
+}
+
+/// Decode a `PriceUpdateV2` account and return the contained price, asserting
+/// that its feed id matches the one configured on the pool.
+pub fn decode_pyth_price(data: &[u8], expected_feed_id: &[u8; 32]) -> Result<Price> {
+    let mut data_ref = data;
+    let account = PriceUpdateV2::try_deserialize(&mut data_ref)
+        .map_err(|e| anyhow!("decode pyth account failed: {e}"))?;
+    account
+        .get_price_unchecked(expected_feed_id)
+        .map_err(|e| anyhow!("pyth feed id mismatch: {e}"))
 }
 
 /// Validate cached pyth prices for the dynamic-fee path.
