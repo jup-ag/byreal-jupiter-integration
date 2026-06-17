@@ -1063,9 +1063,9 @@ mod tests {
         amm.amm.pool_state.set_quote_token_flag(true);
         amm.amm.pool_state.open_time = 0;
         amm.amm.pool_state.arbitrage_fee_buffer_ppm = 10_000;
-        amm.amm.pool_state.trade_slippage_fee_base = 50;
+        amm.amm.pool_state.trade_slippage_fee_base_milli_bp = 50;
         amm.amm.pool_state.trade_slippage_fee_trade_size_threshold = 1;
-        amm.amm.pool_state.imbalance_fee_base = 20;
+        amm.amm.pool_state.imbalance_fee_base_tenths_of_bp = 20;
         amm.amm.pool_state.imbalance_fee_x = 50;
         amm.amm.amm_config.trade_fee_rate = 1_200;
         amm.amm.token0_vault_amount = 5_000_000_000;
