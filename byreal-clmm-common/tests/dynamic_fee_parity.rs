@@ -46,24 +46,26 @@ fn arbitrage_fee_matches_contract_cases() {
 
 #[test]
 fn trade_slippage_fee_matches_contract_cases() {
+    // fee = ceil(base * sqrt(delta_raw) / 10) ppm
     assert_eq!(calculate_trade_slippage_fee(100, 10, 1).unwrap(), 0);
-    assert_eq!(calculate_trade_slippage_fee(200, 10, 1).unwrap(), 100_000);
+    assert_eq!(calculate_trade_slippage_fee(200, 10, 1).unwrap(), 10);
     assert_eq!(calculate_trade_slippage_fee(500, 0, 1).unwrap(), 0);
-    assert_eq!(calculate_trade_slippage_fee(100, 10, 0).unwrap(), 100_000);
-    assert_eq!(calculate_trade_slippage_fee(101, 10, 1).unwrap(), 10_000);
+    assert_eq!(calculate_trade_slippage_fee(100, 10, 0).unwrap(), 10);
+    assert_eq!(calculate_trade_slippage_fee(101, 10, 1).unwrap(), 1);
 }
 
 #[test]
 fn imbalance_fee_matches_contract_cases() {
+    // fee = ceil(over_ppm * base / 100000) ppm）
     assert_eq!(
         calculate_imbalance_fee(150, 50, 5, 10, false).unwrap(),
-        200_000
+        20
     );
     assert_eq!(calculate_imbalance_fee(150, 50, 5, 10, true).unwrap(), 0);
     assert_eq!(calculate_imbalance_fee(100, 100, 5, 10, false).unwrap(), 0);
     assert_eq!(
         calculate_imbalance_fee(50, 150, 5, 10, true).unwrap(),
-        200_000
+        20
     );
     assert_eq!(calculate_imbalance_fee(0, 0, 5, 10, false).unwrap(), 0);
     assert_eq!(calculate_imbalance_fee(550, 450, 5, 10, false).unwrap(), 0);
@@ -83,17 +85,17 @@ fn dynamic_fee_rate_matches_contract_cases() {
         is_buying_base: false,
         fee_base: 1_000,
         arbitrage_fee_buffer_ppm: 0,
-        trade_slippage_fee_base: 10,
+        trade_slippage_fee_base_milli_bp: 10,
         trade_slippage_fee_trade_size_threshold: 1,
-        imbalance_fee_base: 5,
+        imbalance_fee_base_tenths_of_bp: 5,
         imbalance_fee_x: 100,
     })
     .unwrap();
     assert_eq!(result.arbitrage_fee, 9_000);
-    assert_eq!(result.trade_slippage_fee, 100_000);
+    assert_eq!(result.trade_slippage_fee, 10);
     assert_eq!(result.imbalance_fee, 0);
-    assert_eq!(result.swap_dynamic_fee, 109_000);
-    assert_eq!(result.total_fee_rate, 110_000);
+    assert_eq!(result.swap_dynamic_fee, 9_010);
+    assert_eq!(result.total_fee_rate, 10_010);
 
     let zero_result = calculate_dynamic_fee_rate(&DynamicFeeInputs {
         p_0: fixed_point_64::Q64,
@@ -104,9 +106,9 @@ fn dynamic_fee_rate_matches_contract_cases() {
         is_buying_base: false,
         fee_base: 1_000,
         arbitrage_fee_buffer_ppm: 0,
-        trade_slippage_fee_base: 10,
+        trade_slippage_fee_base_milli_bp: 10,
         trade_slippage_fee_trade_size_threshold: 1,
-        imbalance_fee_base: 5,
+        imbalance_fee_base_tenths_of_bp: 5,
         imbalance_fee_x: 10,
     })
     .unwrap();
@@ -125,9 +127,9 @@ fn dynamic_fee_rate_matches_contract_cases() {
         is_buying_base: false,
         fee_base: 500_000,
         arbitrage_fee_buffer_ppm: 0,
-        trade_slippage_fee_base: 0,
+        trade_slippage_fee_base_milli_bp: 0,
         trade_slippage_fee_trade_size_threshold: 1,
-        imbalance_fee_base: 0,
+        imbalance_fee_base_tenths_of_bp: 0,
         imbalance_fee_x: 10,
     })
     .is_err());
@@ -141,17 +143,17 @@ fn dynamic_fee_rate_matches_contract_cases() {
         is_buying_base: false,
         fee_base: 1_000,
         arbitrage_fee_buffer_ppm: 5_000,
-        trade_slippage_fee_base: 5,
+        trade_slippage_fee_base_milli_bp: 5,
         trade_slippage_fee_trade_size_threshold: 1,
-        imbalance_fee_base: 3,
+        imbalance_fee_base_tenths_of_bp: 3,
         imbalance_fee_x: 5,
     })
     .unwrap();
     assert_eq!(all_nonzero.arbitrage_fee, 44_000);
-    assert_eq!(all_nonzero.trade_slippage_fee, 100_000);
-    assert_eq!(all_nonzero.imbalance_fee, 105_000);
-    assert_eq!(all_nonzero.swap_dynamic_fee, 249_000);
-    assert_eq!(all_nonzero.total_fee_rate, 250_000);
+    assert_eq!(all_nonzero.trade_slippage_fee, 10);
+    assert_eq!(all_nonzero.imbalance_fee, 11);
+    assert_eq!(all_nonzero.swap_dynamic_fee, 44_021);
+    assert_eq!(all_nonzero.total_fee_rate, 45_021);
 }
 
 #[test]

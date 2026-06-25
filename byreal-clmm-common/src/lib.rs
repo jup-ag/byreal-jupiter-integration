@@ -40,6 +40,14 @@ const DYNAMIC_MAX_PYTH_AGE_SECONDS: i64 = 3600;
 /// Shard id used by the on-chain push-oracle program when deriving the
 /// price-feed account address from a Pyth feed id.
 const PYTH_PRICE_SHARD_ID: u16 = 0;
+/// exact-output trade_size cap multiplier; mirrors the contract's private
+/// `EXACT_OUTPUT_TRADE_SIZE_CAP_MULTIPLIER` in programs/amm/src/states/pool.rs.
+const EXACT_OUTPUT_TRADE_SIZE_CAP_MULTIPLIER: u128 = 3;
+/// Fast-path iterations for the exact-output dynamic-fee fixed-point. The common
+/// case (typical pools) converges in 2-3 naive steps; if it has not converged
+/// within this many, we fall back to a bounded exponential-bracket + binary
+/// search (step count bounded by the u64 bit width — no unproved iteration cap).
+const EXACT_OUT_FEE_FAST_ITERS: u32 = 4;
 
 #[derive(Clone)]
 pub enum DynamicTickArrayState {
@@ -631,6 +639,38 @@ pub fn compute_trade_fee_rate(
     is_base_input: bool,
     current_timestamp: i64,
 ) -> Result<u32> {
+    dynamic_fee_rate(
+        pool_state,
+        amm_config,
+        token0_pyth_price,
+        token1_pyth_price,
+        token0_vault_amount,
+        token1_vault_amount,
+        zero_for_one,
+        amount_specified,
+        is_base_input,
+        None,
+        current_timestamp,
+    )
+}
+
+/// Dynamic fee rate. For exact-output, `exact_out_amount_in_max` is the swap ix's
+/// `other_amount_threshold`; it drives trade_size = min(amount_in_max_quote, output*3),
+/// exactly as the on-chain contract does. Exact-input ignores it.
+#[allow(clippy::too_many_arguments)]
+fn dynamic_fee_rate(
+    pool_state: &PoolState,
+    amm_config: &AmmConfig,
+    token0_pyth_price: Option<&Price>,
+    token1_pyth_price: Option<&Price>,
+    token0_vault_amount: u64,
+    token1_vault_amount: u64,
+    zero_for_one: bool,
+    amount_specified: u64,
+    is_base_input: bool,
+    exact_out_amount_in_max: Option<u64>,
+    current_timestamp: i64,
+) -> Result<u32> {
     let fee_rate = pool_state
         .calculate_base_trade_fee_rate(amm_config, zero_for_one, current_timestamp as u64)
         .map_err(|e| anyhow!("base trade fee computation failed: {e}"))?;
@@ -664,12 +704,27 @@ pub fn compute_trade_fee_rate(
             quote_amount_from_base(amount_specified as u128, p_0, token1_as_quote)?
         }
     } else {
-        let output_is_quote = !input_is_quote;
-        if output_is_quote {
-            amount_specified as u128
-        } else {
+        // exact-output: mirror the contract (pool.rs::calculate_dynamic_fee_rate) —
+        // trade_size = min(amount_in_max_quote, output_quote * CAP), where amount_in_max is
+        // the SAME value the swap ix carries as other_amount_threshold (for Jupiter that is
+        // the reported in_amount, no slippage).
+        let amount_in_max = exact_out_amount_in_max
+            .ok_or_else(|| anyhow!("exact-output dynamic fee requires amount_in_max"))?
+            as u128;
+        let output_quote = if input_is_quote {
             quote_amount_from_base(amount_specified as u128, p_0, token1_as_quote)?
-        }
+        } else {
+            amount_specified as u128
+        };
+        let input_max_quote = if input_is_quote {
+            amount_in_max
+        } else {
+            quote_amount_from_base(amount_in_max, p_0, token1_as_quote)?
+        };
+        let cap = output_quote
+            .checked_mul(EXACT_OUTPUT_TRADE_SIZE_CAP_MULTIPLIER)
+            .unwrap_or(u128::MAX);
+        std::cmp::min(input_max_quote, cap)
     };
 
     let quote_decimals = if token1_as_quote {
@@ -706,10 +761,10 @@ pub fn compute_trade_fee_rate(
         is_buying_base,
         fee_base: fee_rate,
         arbitrage_fee_buffer_ppm: pool_state.arbitrage_fee_buffer_ppm,
-        trade_slippage_fee_base: pool_state.trade_slippage_fee_base,
+        trade_slippage_fee_base_milli_bp: pool_state.trade_slippage_fee_base_milli_bp,
         trade_slippage_fee_trade_size_threshold: pool_state
             .trade_slippage_fee_trade_size_threshold,
-        imbalance_fee_base: pool_state.imbalance_fee_base,
+        imbalance_fee_base_tenths_of_bp: pool_state.imbalance_fee_base_tenths_of_bp,
         imbalance_fee_x: pool_state.imbalance_fee_x,
     })?;
 
@@ -804,6 +859,144 @@ pub fn compute_swap(
         )
     };
 
+    let result = if !is_base_input && inputs.pool_state.is_swap_dynamic_fee_enabled() {
+        // exact-output + dynamic fee: on-chain trade_size = min(other_amount_threshold_quote,
+        // output*3), and the swap ix carries other_amount_threshold = the reported in_amount
+        // (no slippage; route-level slippage is applied outside the AMM). in_amount depends on
+        // the fee rate and the fee rate depends on in_amount, so resolve a MONOTONIC
+        // LEAST-FIXED-POINT: start the threshold at 0 (=> slippage_fee 0) and iterate; in_amount
+        // is non-decreasing and bounded, so it converges to the self-consistent value where the
+        // reported in_amount equals the threshold the fee was computed with.
+        // f(t) = simulate(fee(min(t_quote, output*3))).amount_in, where t is the candidate
+        // other_amount_threshold (= reported in_amount). f is NON-DECREASING in t, and one can
+        // show f(t) >= t for all t <= t* (the least fixed point), with equality at t*. We solve
+        // for t* with a guaranteed-terminating search.
+        let eval = |amount_in_max: u64| -> Result<SwapResult> {
+            let fee_rate = dynamic_fee_rate(
+                inputs.pool_state,
+                inputs.amm_config,
+                inputs.token0_pyth_price,
+                inputs.token1_pyth_price,
+                inputs.token0_vault_amount,
+                inputs.token1_vault_amount,
+                zero_for_one,
+                amount_specified,
+                false,
+                Some(amount_in_max),
+                current_timestamp,
+            )?;
+            simulate_swap_steps(
+                inputs,
+                fee_rate,
+                amount_calculate_specified,
+                sqrt_price_limit,
+                is_base_input,
+                zero_for_one,
+                current_timestamp,
+                current_epoch,
+                input_transfer_config,
+                output_transfer_config,
+                specified_transfer_fee,
+            )
+        };
+
+        // Fast path: naive monotonic iteration from 0 (converges in 2-3 steps for typical pools).
+        let mut lo = 0u64;
+        let mut converged: Option<SwapResult> = None;
+        for _ in 0..EXACT_OUT_FEE_FAST_ITERS {
+            let r = eval(lo)?;
+            if r.amount_in == lo {
+                converged = Some(r);
+                break;
+            }
+            lo = r.amount_in; // monotonic: f(lo) >= lo, strictly increasing toward t*
+        }
+        match converged {
+            Some(r) => r,
+            None => {
+                // Slow path (rare, high-fee pools): `lo` is a lower bound with f(lo) > lo.
+                // Grow an upper bracket `hi` until f(hi) <= hi OR f(hi) errors — both mean
+                // hi >= t*. A fee-cap error means the threshold is too high, NOT that the swap is
+                // invalid, so it must NOT be propagated during the search; the doubling saturates
+                // at u64::MAX so it always terminates. Then binary search [lo, hi] for the least
+                // fixed point, treating an eval error as "mid > t*" (search lower). Only the final
+                // t* eval propagates (a genuine rejection the contract would share).
+                let mut hi = lo.max(1);
+                while matches!(eval(hi), Ok(r) if r.amount_in > hi) {
+                    if hi == u64::MAX {
+                        break;
+                    }
+                    hi = hi.saturating_mul(2);
+                }
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let above = matches!(eval(mid), Ok(r) if r.amount_in > mid);
+                    if above {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let r = eval(lo)?;
+                // For a non-decreasing f, the least t with f(t) <= t is necessarily a fixed
+                // point; verify to guard the monotonicity assumption.
+                if r.amount_in != lo {
+                    return Err(anyhow!(
+                        "exact-out dynamic-fee fixed point not self-consistent (in_amount={}, threshold={})",
+                        r.amount_in,
+                        lo
+                    ));
+                }
+                r
+            }
+        }
+    } else {
+        let fee_rate = compute_trade_fee_rate(
+            inputs.pool_state,
+            inputs.amm_config,
+            inputs.token0_pyth_price,
+            inputs.token1_pyth_price,
+            inputs.token0_vault_amount,
+            inputs.token1_vault_amount,
+            zero_for_one,
+            amount_specified,
+            is_base_input,
+            current_timestamp,
+        )?;
+        simulate_swap_steps(
+            inputs,
+            fee_rate,
+            amount_calculate_specified,
+            sqrt_price_limit,
+            is_base_input,
+            zero_for_one,
+            current_timestamp,
+            current_epoch,
+            input_transfer_config,
+            output_transfer_config,
+            specified_transfer_fee,
+        )?
+    };
+    Ok(result)
+}
+
+/// Run the swap-step loop for a GIVEN fee_rate and finalize amounts (including transfer
+/// fees). Factored out of `compute_swap` so the exact-output dynamic-fee fixed-point can
+/// re-run it with successive fee rates.
+#[allow(clippy::too_many_arguments)]
+fn simulate_swap_steps(
+    inputs: SwapInputs,
+    fee_rate: u32,
+    amount_calculate_specified: u64,
+    sqrt_price_limit: u128,
+    is_base_input: bool,
+    zero_for_one: bool,
+    current_timestamp: i64,
+    current_epoch: u64,
+    input_transfer_config: Option<&TransferFeeConfig>,
+    output_transfer_config: Option<&TransferFeeConfig>,
+    specified_transfer_fee: u64,
+) -> Result<SwapResult> {
     // Initialize swap state
     let mut state = SwapState {
         amount_specified_remaining: amount_calculate_specified,
@@ -813,19 +1006,6 @@ pub fn compute_swap(
         liquidity: inputs.pool_state.liquidity,
         fee_amount: 0,
     };
-
-    let fee_rate = compute_trade_fee_rate(
-        inputs.pool_state,
-        inputs.amm_config,
-        inputs.token0_pyth_price,
-        inputs.token1_pyth_price,
-        inputs.token0_vault_amount,
-        inputs.token1_vault_amount,
-        zero_for_one,
-        amount_specified,
-        is_base_input,
-        current_timestamp,
-    )?;
 
     // Initialize tick-array navigation state so that tick discovery mirrors
     // the on-chain `swap_internal` helper logic.
