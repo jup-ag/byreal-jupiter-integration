@@ -12,7 +12,7 @@ solana-address = "2.6"
 spl-token-2022-interface = "3.1.1"
 
 # Raydium dependencies
-byreal-clmm = { git = "https://github.com/jup-ag/byreal-clmm.git", rev = "85855942a7df8ea2726d851a157e03b0bd326fee", features = ["no-entrypoint"] }
+byreal-clmm = { git = "https://github.com/jup-ag/byreal-clmm.git", rev = "68da3eedf36edcece0d9a156d2886bff5a90d327", features = ["no-entrypoint"] }
 bytemuck = { version = "1", features = ["derive"] }
 pyth-solana-receiver-sdk = { git = "https://github.com/pyth-network/pyth-crosschain.git", rev = "f80b82011a227ab541a0b16b3eb57a15bf6a0ad6" }
 
