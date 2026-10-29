@@ -9,7 +9,7 @@ anchor-lang = "1.0.2"
 anyhow = "1.0.97"
 
 solana-address = "2.6"
-spl-token-2022-interface = "2.1.0"
+spl-token-2022-interface = "3.1.1"
 
 # Raydium dependencies
 byreal-clmm = { git = "https://github.com/jup-ag/byreal-clmm.git", rev = "85855942a7df8ea2726d851a157e03b0bd326fee", features = ["no-entrypoint"] }
